@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     postgres_host: str = "localhost"
     postgres_port: int = 5432
 
+    dart_api_key: str 
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
