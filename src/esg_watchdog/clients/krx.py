@@ -1,7 +1,7 @@
 import json
 import re
 from html import unescape
-from urllib.parse import urlencode, urljoin
+from urllib.parse import quote, urlencode, urljoin
 from urllib.request import Request, urlopen
 
 
@@ -134,5 +134,6 @@ class KrxClient:
 
         pdf_path = unescape(pdf_match.group(1))
 
-        # 상대경로 → 완전한 PDF URL
-        return urljoin(document_url, pdf_path)
+        pdf_url = urljoin(document_url, pdf_path)
+
+        return quote(pdf_url, safe=":/?&=")
