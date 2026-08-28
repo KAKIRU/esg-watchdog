@@ -136,4 +136,7 @@ class KrxClient:
 
         pdf_url = urljoin(document_url, pdf_path)
 
-        return quote(pdf_url, safe=":/?&=")
+        return quote(
+            pdf_url,
+            safe=":/?&=%",
+        )
