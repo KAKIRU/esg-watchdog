@@ -58,6 +58,13 @@ COMPANIES = [
         aliases=["DL이앤씨"],
         industry_key="construction",
     ),
+    Company(
+        name="오뚜기",
+        stock_code="007310",
+        corp_code="00141529",
+        aliases=["오뚜기", "OTOKI"],
+        industry_key="food_manufacturing",
+    ),
 ]
 
 def seed_companies() -> None:
