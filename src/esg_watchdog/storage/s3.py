@@ -22,3 +22,11 @@ class S3Storage:
         )
 
         return key;
+
+    def download_pdf(self, key: str) -> bytes:
+        response = self.s3_client.get_object(
+            Bucket=self.bucket,
+            Key=key,
+        )
+
+        return response["Body"].read()

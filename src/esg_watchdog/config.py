@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     aws_region: str = "ap-northeast-2"
     aws_s3_bucket: str
 
+    naver_client_id: str
+    naver_client_secret: str
 
     model_config = SettingsConfigDict(
         env_file=".env",
