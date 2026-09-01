@@ -8,6 +8,7 @@ class Settings(BaseSettings):
 
     postgres_host: str = "localhost"
     postgres_port: int = 5432
+    postgres_sslmode: str = "disable"
 
     dart_api_key: str 
 

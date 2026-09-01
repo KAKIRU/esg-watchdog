@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-esg-watchdog = "esg_watchdog:main"
+esg-watchdog = "esg_watchdog.jobs.daily_polling:run"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
