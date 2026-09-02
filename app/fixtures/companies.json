@@ -1,0 +1,5 @@
+[
+  {"id": 1, "stock_code": "030200", "name": "KT", "industry_key": "telecom", "is_control_group": false},
+  {"id": 2, "stock_code": "005610", "name": "SPC삼립", "industry_key": "food", "is_control_group": false},
+  {"id": 3, "stock_code": "007310", "name": "오뚜기", "industry_key": "food", "is_control_group": true}
+]
