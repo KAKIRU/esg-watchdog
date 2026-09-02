@@ -13,6 +13,6 @@ database_url = URL.create(
     query={"sslmode": settings.postgres_sslmode},
 )
 
-engine = create_engine(database_url)
+engine = create_engine(database_url, pool_pre_ping=True)
 
 SessionLocal = sessionmaker(bind=engine)

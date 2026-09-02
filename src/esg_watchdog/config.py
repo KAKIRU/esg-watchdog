@@ -8,17 +8,17 @@ class Settings(BaseSettings):
 
     postgres_host: str = "localhost"
     postgres_port: int = 5432
-    postgres_sslmode: str = "disable"
+    postgres_sslmode: str = "prefer"
 
-    dart_api_key: str 
+    dart_api_key: str = ""
 
-    aws_access_key_id: str
-    aws_secret_access_key: str
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
     aws_region: str = "ap-northeast-2"
-    aws_s3_bucket: str
+    aws_s3_bucket: str = ""
 
-    naver_client_id: str
-    naver_client_secret: str
+    naver_client_id: str = ""
+    naver_client_secret: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",
