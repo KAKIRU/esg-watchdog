@@ -1,7 +1,7 @@
 [project]
 name = "esg-watchdog"
 version = "0.1.0"
-description = "Add your description here"
+description = "ESG 공시·실제 사건 교차검증 조기경보 (2026 금융 AI Challenge)"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -12,11 +12,12 @@ dependencies = [
     "psycopg[binary]>=3.3.4",
     "pydantic-settings>=2.15.0",
     "pypdf>=6.16.2",
+    "pyyaml>=6.0",
     "sqlalchemy>=2.0.52",
 ]
 
 [project.scripts]
-esg-watchdog = "esg_watchdog.jobs.daily_polling:run"
+esg-watchdog = "esg_watchdog.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
@@ -26,4 +27,10 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.3",
+]
+ui = [
+    "streamlit>=1.40",
+    "pandas>=2.2",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
 ]

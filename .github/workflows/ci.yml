@@ -30,7 +30,7 @@ jobs:
         run: uv python install
 
       - name: Install dependencies
-        run: uv sync --locked --dev
+        run: uv sync --locked --dev --group ui
 
       - name: Run Ruff
         run: uv run ruff check .

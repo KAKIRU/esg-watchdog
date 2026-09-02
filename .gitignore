@@ -21,3 +21,7 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# LLM cache / local data
+.llm_cache/
+data/

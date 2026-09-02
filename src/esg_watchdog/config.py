@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     naver_client_id: str = ""
     naver_client_secret: str = ""
 
+    llm_provider: str = ""
+    llm_api_key: str = ""
+    llm_model_extract: str = ""
+    llm_model_judge: str = ""
+    llm_cache_dir: str = ".llm_cache"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
