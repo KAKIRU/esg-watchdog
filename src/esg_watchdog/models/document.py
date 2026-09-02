@@ -1,9 +1,10 @@
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Identity,
@@ -28,6 +29,9 @@ class Document(Base):
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     needs_ocr: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    # 보고서 발간일 (D-36)
+    published_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (

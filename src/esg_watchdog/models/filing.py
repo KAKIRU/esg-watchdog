@@ -29,6 +29,9 @@ class Filing(Base):
     filed_at: Mapped[date] = mapped_column(Date, nullable=False)
     raw_storage_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
+    # DART 공시유형 코드 1자 (A 정기공시 등) (D-36)
+    pblntf_ty: Mapped[str | None] = mapped_column(String(1), nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (

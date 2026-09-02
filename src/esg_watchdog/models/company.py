@@ -24,6 +24,8 @@ class Company(Base):
     corp_code: Mapped[str] = mapped_column(String(8), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(Text, nullable=False)
     aliases: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default=text("'{}'::text[]"))
+    # 동명이인 제외어 (예: KT → KT&G, KTX). 뉴스 쿼리·매칭에서 뺀다 (D-36)
+    exclude_terms: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default=text("'{}'::text[]"))
     industry_key: Mapped[str] = mapped_column(Text, nullable=False)
     is_control_group: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
