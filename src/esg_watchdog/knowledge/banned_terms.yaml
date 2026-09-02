@@ -1,0 +1,56 @@
+version: v1
+decided_at: "2026-09-01"
+decision: D-17
+
+policy:
+  applies_to: [headline, explanation, limitation, fallback]
+  excluded: [evidence_quote, commitment_quote, event_quote, rationale, title, summary]
+  match: pattern_or_substring_with_allowlist
+  case_sensitive: false
+  on_violation: regenerate_once_then_discard
+  regeneration_hint: "다음 표현을 쓰지 말고 다시 쓰세요: {hit_terms}. 매매 판단·가격 전망·확정적 단정 없이, 공시 문장과 보도 사실만 제시하세요."
+
+never_ban: [위반, 후퇴, 이행지연, 이행긍정, 리스크, 중대성, 경보, 불확실]
+
+terms:
+  # ① 매매 권유·행동 지시
+  - {term: 매수, category: 매매권유, pattern: "(?<![구판도])매수", allow: [매수세, 순매수, 매수자, 매수인], replacement: null}
+  - {term: 매도, category: 매매권유, pattern: "(?<![구판])매도", allow: [매도세, 순매도, 매도자, 매도인], replacement: null}
+  - {term: 사세요, category: 매매권유, allow: [], replacement: null}
+  - {term: 파세요, category: 매매권유, allow: [], replacement: null}
+  - {term: 비중 확대, category: 매매권유, allow: [], replacement: null}
+  - {term: 손절, category: 매매권유, allow: [], replacement: null}
+  - {term: 익절, category: 매매권유, allow: [], replacement: null}
+  # ② 가격·수익률 전망
+  - {term: 목표주가, category: 가격전망, allow: [], replacement: "재무적 중대성 점수"}
+  - {term: 적정주가, category: 가격전망, allow: [], replacement: "재무적 중대성 점수"}
+  - {term: 상승 여력, category: 가격전망, allow: [], replacement: null}
+  - {term: 하락 여력, category: 가격전망, allow: [], replacement: null}
+  - {term: 주가 전망, category: 가격전망, allow: [], replacement: null}
+  - {term: 수익률, category: 가격전망, allow: [], replacement: "확인된 재무 수치"}
+  # ③ 밸류에이션 단정
+  - {term: 저평가, category: 밸류에이션, allow: [], replacement: null}
+  - {term: 고평가, category: 밸류에이션, allow: [], replacement: null}
+  - {term: 저점, category: 밸류에이션, allow: [최저점], replacement: null}
+  - {term: 고점, category: 밸류에이션, allow: [최고점], replacement: null}
+  - {term: 바닥, category: 밸류에이션, allow: [공장 바닥, 바닥재, 바닥면], replacement: null}
+  # ④ 추천·자문 프레이밍
+  - {term: 추천, category: 투자자문, allow: [추천 알고리즘], replacement: "확인이 필요한 항목"}
+  - {term: 유망, category: 투자자문, allow: [유망기술, 유망산업], replacement: null}
+  - {term: 투자의견, category: 투자자문, allow: [], replacement: null}
+  - {term: 관심 종목, category: 투자자문, allow: [], replacement: null}
+  - {term: 포트폴리오, category: 투자자문, allow: [사업 포트폴리오, 제품 포트폴리오, 브랜드 포트폴리오], replacement: null}
+  - {term: 필수 보유, category: 투자자문, allow: [], replacement: null}
+  # ⑤ 확정적 단정
+  - {term: 반드시, category: 확정단정, allow: [], replacement: null}
+  - {term: 확실히, category: 확정단정, pattern: "(?<!불)확실(히|한|하다|합니다|해)", allow: [], replacement: null}
+  - {term: 틀림없이, category: 확정단정, allow: [], replacement: null}
+  - {term: 명백히, category: 확정단정, pattern: "명백(히|한|하다|합니다|해)", allow: [], replacement: null}
+  - {term: 100%, category: 확정단정, allow: [100% 자회사, 지분 100%, 재생에너지 100%, 100% 재생에너지], replacement: null}
+  - {term: 보장, category: 확정단정, allow: [고용 보장, 품질 보장, 안전 보장, 보장성, 사회보장], replacement: null}
+  # ⑥ 사법 판단 단정
+  - {term: 유죄, category: 사법단정, allow: [], replacement: "…로 고발되었습니다"}
+  - {term: 사기, category: 사법단정, pattern: "(?<![수조검감심인회])사기", allow: [사기업, 사기진작, 사기 혐의], replacement: "…혐의로 보도되었습니다"}
+  - {term: 분식회계, category: 사법단정, allow: [], replacement: "회계 처리에 대한 지적이 제기되었습니다"}
+  - {term: 범죄, category: 사법단정, allow: [범죄예방, 사이버범죄], replacement: "…혐의"}
+  - {term: 불법, category: 사법단정, allow: [불법 펨토셀], replacement: "…법 위반으로 의결되었습니다"}
