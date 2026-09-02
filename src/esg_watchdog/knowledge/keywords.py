@@ -10,6 +10,7 @@ ESG_KEYWORDS = {
 # 44개 (10+10+8+8+8). 결정 로그 D-01·키워드 사전의 "40개"는 오기 — 목록은 확정본 그대로
 ALL_KEYWORDS = [k for g in ESG_KEYWORDS.values() for k in g]
 
+# 본선 확대 후보(옛 시드 9곳 중 3사 외): POSCO홀딩스 005490 · GS건설 006360 · HDC현대산업개발 294870 · 한국타이어앤테크놀로지 161390 · NAVER 035420 · DL이앤씨 375500
 COMPANIES = [
     {
         "stock_code": "030200",
