@@ -1,12 +1,14 @@
 """esg-watchdog CLI — 배치는 여기서만 돈다 (D-31). 웹 프로세스 안에서 실행하지 않는다.
 
-이번 단계는 seed-companies · load-fixtures 만 구현한다 (D-26 · D-27 · D-33 · D-34).
-collect · extract · detect · match · score · publish · run-all 은 등록만 하고 P4~P6 에서 채운다.
-DB 엔진·boto3 등 무거운 import 는 서브커맨드 함수 안에서만 한다 (--help 는 .env 없이 동작).
+- seed-companies · load-fixtures (D-26 · D-27 · D-33 · D-34)
+- collect --stage news|filings|reports|all (F-01). all = news → filings. reports 는 --pdf 등 인자가 필요해 all 에 없다
+- collect-krx: KRX 자동 수집(S3 업로드) 옵션 경로 — all 에 포함하지 않는다 (D-28)
+- extract · detect · match · score · publish · run-all 은 등록만 하고 P5~P6 에서 채운다.
+DB 엔진·boto3 등 무거운 import 는 서브커맨드 함수 안에서만 한다 (--help 와 import 는 .env 없이 동작).
+pipeline_runs.trigger 는 전부 'manual' (cron 없음).
 """
 
 import argparse
-import hashlib
 import json
 import sys
 from collections.abc import Sequence
@@ -17,7 +19,11 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NOT_IMPLEMENTED = 2
 
-PENDING_COMMANDS = ("collect", "extract", "detect", "match", "score", "publish", "run-all")
+PENDING_COMMANDS = ("extract", "detect", "match", "score", "publish", "run-all")
+
+COLLECT_STAGES = ("news", "filings", "reports", "all")
+# reports 는 사람이 PDF 와 페이지 번호를 준다 — 이 인자가 전부 있어야 한다
+REPORT_REQUIRED = (("company", "--company"), ("pdf", "--pdf"), ("pages", "--pages"), ("title", "--title"), ("fiscal_year", "--fiscal-year"), ("published_at", "--published-at"))
 
 # D-38: 옛 시드(scripts/seed_companies.py)의 industry_key 표기. 보이면 knowledge 값으로 덮어쓴다
 LEGACY_INDUSTRY_KEYS = {"telecommunications": "telecom", "food_manufacturing": "food"}
@@ -72,8 +78,10 @@ def _to_datetime(value: str) -> datetime:
 
 
 def _url_hash(url: str) -> str:
-    # services/polling/naver.py 의 make_url_hash 와 같은 규칙
-    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+    # services/collect/news.py 와 같은 규칙(정규화 URL 의 sha256) — 수집이 같은 기사를 만나면 같은 해시가 나와야 한다
+    from esg_watchdog.services.collect.news import make_url_hash, normalize_url
+
+    return make_url_hash(normalize_url(url))
 
 
 # --------------------------------------------------------------------------- seed-companies
@@ -291,14 +299,139 @@ def cmd_load_fixtures(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# --------------------------------------------------------------------------- collect (F-01)
+def _company_id_for(stock_code: str) -> int:
+    from sqlalchemy import select
+
+    from esg_watchdog.db import SessionLocal
+    from esg_watchdog.models import Company
+
+    with SessionLocal() as session:
+        company_id = session.scalar(select(Company.id).where(Company.stock_code == stock_code))
+    if company_id is None:
+        raise LookupError(f"companies 에 없는 stock_code: {stock_code} — 먼저 `esg-watchdog seed-companies`")
+    return company_id
+
+
+def _print_capped(capped: list[dict]) -> None:
+    """12개월을 못 채운 슬라이스 보고서 — sort=sim 으로 다시 읽어도 since 에 못 닿은 쿼리."""
+    print(f"\n12개월을 못 채운 슬라이스 (capped): {len(capped)}건")
+    if capped:
+        _print_table(("query", "total", "fetched", "oldest"), [(c["query"], c["total"], c["fetched"], c["oldest"]) for c in capped])
+
+
+def _print_errors(errors: list[dict]) -> None:
+    for error in errors:
+        print(f"  error {error}", file=sys.stderr)
+
+
+def _run_news(args: argparse.Namespace) -> str:
+    from esg_watchdog.services.collect.news import collect_news
+
+    result = collect_news(stock_code=args.company, max_pages=args.max_pages)
+    stats = result.stats
+    print(
+        f"\ncollect news: run={result.run_id} status={result.status} queries={stats['queries']} calls={stats['calls']} "
+        f"fetched={stats['fetched']} inserted={stats['inserted']} dup={stats['dup']} excluded={stats['excluded']} "
+        f"no_alias={stats['no_alias']} old={stats['old']} sim_retries={stats['sim_retries']} errors={len(stats['errors'])}"
+    )
+    _print_capped(stats["capped"])
+    _print_errors(stats["errors"])
+    return result.status
+
+
+def _run_filings(args: argparse.Namespace) -> str:
+    from esg_watchdog.services.collect.filings import collect_filings
+
+    result = collect_filings(stock_code=args.company)
+    stats = result.stats
+    print(
+        f"\ncollect filings: run={result.run_id} status={result.status} companies={stats['companies']} "
+        f"fetched={stats['fetched']} inserted={stats['inserted']} dup={stats['dup']} errors={len(stats['errors'])}"
+    )
+    _print_errors(stats["errors"])
+    return result.status
+
+
+def _run_reports(args: argparse.Namespace) -> str:
+    from esg_watchdog.services.collect.reports import ingest_report, parse_pages
+
+    result = ingest_report(
+        company_id=_company_id_for(args.company),
+        pdf_path=args.pdf,
+        pages=parse_pages(args.pages),
+        title=args.title,
+        fiscal_year=args.fiscal_year,
+        published_at=_to_date(args.published_at),
+        source_url=args.source_url,
+    )
+    print(
+        f"\ncollect reports: run={result.run_id} status={result.status} document_id={result.document_id} "
+        f"storage_path={result.storage_path} page_count={result.page_count} pages_loaded={result.pages_loaded} "
+        f"pages_empty={result.pages_empty} needs_ocr={result.needs_ocr}"
+    )
+    for warning in result.warnings:
+        print(f"  warning: {warning}")
+    for error in result.stats.get("errors", []):
+        print(f"  error {error}", file=sys.stderr)
+    return result.status
+
+
+COLLECT_RUNNERS = {"news": _run_news, "filings": _run_filings, "reports": _run_reports}
+
+
+def cmd_collect(args: argparse.Namespace) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    stages = ["news", "filings"] if args.stage == "all" else [args.stage]
+    if "reports" in stages:
+        missing = [flag for attr, flag in REPORT_REQUIRED if getattr(args, attr) is None]
+        if missing:
+            print(f"ERROR: --stage reports 에는 {' '.join(missing)} 가 필요하다", file=sys.stderr)
+            return EXIT_ERROR
+
+    statuses: list[str] = []
+    try:
+        for stage in stages:
+            statuses.append(COLLECT_RUNNERS[stage](args))
+    except (LookupError, FileNotFoundError, ValueError, RuntimeError, SQLAlchemyError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    return EXIT_ERROR if "failed" in statuses else EXIT_OK
+
+
+# --------------------------------------------------------------------------- collect-krx (옵션 경로)
+def cmd_collect_krx(args: argparse.Namespace) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from esg_watchdog.services.collect.krx import (
+        collect_krx,  # boto3 는 이 경로에서만 로드된다
+    )
+
+    try:
+        result = collect_krx(stock_code=args.company)
+    except (LookupError, RuntimeError, SQLAlchemyError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    stats = result.stats
+    print(
+        f"\ncollect-krx: run={result.run_id} status={result.status} companies={stats['companies']} "
+        f"fetched={stats['fetched']} inserted={stats['inserted']} skipped={stats['skipped']} errors={len(stats['errors'])}"
+    )
+    _print_errors(stats["errors"])
+    return EXIT_ERROR if result.status == "failed" else EXIT_OK
+
+
 # --------------------------------------------------------------------------- 미구현 단계
 def cmd_not_implemented(args: argparse.Namespace) -> int:
-    print(f"{args.command}: P4~P6에서 구현", file=sys.stderr)
+    print(f"{args.command}: P5~P6에서 구현", file=sys.stderr)
     return EXIT_NOT_IMPLEMENTED
 
 
 # --------------------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
+    from esg_watchdog.services.collect.news import DEFAULT_MAX_PAGES
+
     parser = argparse.ArgumentParser(prog="esg-watchdog", description="ESG 공시·실제 사건 교차검증 배치 CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -313,8 +446,37 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--merge", action="store_true", help="비우지 않고 적재, 같은 id 는 건너뛰고 수를 보고")
     load.set_defaults(func=cmd_load_fixtures)
 
+    collect = subparsers.add_parser(
+        "collect",
+        help="F-01 수집: news(네이버 뉴스) · filings(DART 후속공시 목록) · reports(보고서 PDF 지정 페이지) · all(news → filings)",
+        description="F-01 수집. all = news → filings (reports 는 --pdf 등 인자가 필요해 all 에 없다). pipeline_runs.trigger 는 manual.",
+    )
+    collect.add_argument("--stage", choices=COLLECT_STAGES, required=True)
+    collect.add_argument("--company", metavar="STOCK_CODE", help="한 회사만 (기본: companies.is_active 전부). reports 는 필수")
+    collect.add_argument(
+        "--max-pages",
+        type=int,
+        default=DEFAULT_MAX_PAGES,
+        help=f"news: 쿼리당 페이지 수 (display=100, 기본 {DEFAULT_MAX_PAGES} = API 상한 start≤1000)",
+    )
+    reports = collect.add_argument_group("reports (--stage reports 일 때 필수)")
+    reports.add_argument("--pdf", help="로컬 PDF 경로 (예: data/reports/030200_SR_2025.pdf)")
+    reports.add_argument("--pages", help="적재할 페이지 번호 (1-based, 예: 17,31,33,35,81 · 범위 3-5 가능)")
+    reports.add_argument("--title", help='예: "2025 KT ESG보고서"')
+    reports.add_argument("--fiscal-year", type=int, help="예: 2024")
+    reports.add_argument("--published-at", help="발간일 YYYY-MM-DD. 2025-09-01 이후면 D-10 경고")
+    reports.add_argument("--source-url", help="보고서 원문 URL (선택)")
+    collect.set_defaults(func=cmd_collect)
+
+    krx = subparsers.add_parser(
+        "collect-krx",
+        help="(옵션) KRX ESG 포털 보고서 자동 수집 → S3 업로드 → documents. AWS 키 필요. collect --stage all 에 포함되지 않는다",
+    )
+    krx.add_argument("--company", metavar="STOCK_CODE", help="한 회사만 (기본: companies.is_active 전부)")
+    krx.set_defaults(func=cmd_collect_krx)
+
     for name in PENDING_COMMANDS:
-        pending = subparsers.add_parser(name, help="P4~P6에서 구현")
+        pending = subparsers.add_parser(name, help="P5~P6에서 구현")
         pending.set_defaults(func=cmd_not_implemented)
 
     return parser
