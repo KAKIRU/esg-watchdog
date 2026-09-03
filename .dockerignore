@@ -1,0 +1,15 @@
+.git
+.venv
+.env
+.env.*
+data/
+**/*.pdf
+tests/
+src/
+alembic/
+alembic.ini
+scripts/
+docs/
+__pycache__/
+*.pyc
+.llm_cache/
