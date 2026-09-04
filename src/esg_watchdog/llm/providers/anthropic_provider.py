@@ -62,7 +62,6 @@ class AnthropicProvider:
                 messages=[{"role": "user", "content": user}],
                 tools=[tool],
                 tool_choice={"type": "tool", "name": tool_name, "disable_parallel_tool_use": True},
-                extra_body={"temperature": 0},
             )
         except sdk.APIConnectionError as exc:  # APITimeoutError 포함
             raise TransientProviderError(f"anthropic 연결/타임아웃: {exc}") from exc
