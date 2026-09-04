@@ -27,7 +27,7 @@ terms:
   - {term: 상승 여력, category: 가격전망, allow: [], replacement: null}
   - {term: 하락 여력, category: 가격전망, allow: [], replacement: null}
   - {term: 주가 전망, category: 가격전망, allow: [], replacement: null}
-  - {term: 수익률, category: 가격전망, allow: [], replacement: "확인된 재무 수치"}
+  - {term: 수익률, category: 가격전망, allow: [영업이익률, 순이익률, 총수익률], replacement: "확인된 재무 수치"}
   # ③ 밸류에이션 단정
   - {term: 저평가, category: 밸류에이션, allow: [], replacement: null}
   - {term: 고평가, category: 밸류에이션, allow: [], replacement: null}
@@ -47,7 +47,7 @@ terms:
   - {term: 틀림없이, category: 확정단정, allow: [], replacement: null}
   - {term: 명백히, category: 확정단정, pattern: "명백(히|한|하다|합니다|해)", allow: [], replacement: null}
   - {term: 100%, category: 확정단정, allow: [100% 자회사, 지분 100%, 재생에너지 100%, 100% 재생에너지], replacement: null}
-  - {term: 보장, category: 확정단정, allow: [고용 보장, 품질 보장, 안전 보장, 보장성, 사회보장], replacement: null}
+  - {term: 보장, category: 확정단정, allow: [고용 보장, 품질 보장, 안전 보장, 보장성, 사회보장, 보장한다고 밝혔], replacement: null}
   # ⑥ 사법 판단 단정
   - {term: 유죄, category: 사법단정, allow: [], replacement: "…로 고발되었습니다"}
   - {term: 사기, category: 사법단정, pattern: "(?<![수조검감심인회])사기", allow: [사기업, 사기진작, 사기 혐의], replacement: "…혐의로 보도되었습니다"}

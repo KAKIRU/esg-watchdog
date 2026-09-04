@@ -7,7 +7,8 @@
 - detect --company <code> [--limit N] [--yes] [--all] (F-03): articles → events. 사전 필터 통과 M건 → 배치 K회를 먼저 출력, 200건 초과는 --yes 필요
 - match --company <code> (F-04): 후보 SQL → LLM 관계 판정 → matches
 - score [--company <code>] (F-05): matches.scores 전체 재계산 (LLM 없음, D-15)
-- publish · run-all 은 등록만 하고 P6 에서 채운다.
+- publish [--company <code>] (F-06): accepted 매칭 → 등급 · 설명문 · 금지어 필터 → alerts
+- run-all --company <code> [--detect-limit N]: collect news · filings → extract → detect → match → score → publish. 한 단계 실패 시 중단
 DB 엔진·boto3 등 무거운 import 는 서브커맨드 함수 안에서만 한다 (--help 와 import 는 .env 없이 동작).
 pipeline_runs.trigger 는 전부 'manual' (cron 없음).
 """
@@ -21,9 +22,9 @@ from pathlib import Path
 
 EXIT_OK = 0
 EXIT_ERROR = 1
-EXIT_NOT_IMPLEMENTED = 2
 
-PENDING_COMMANDS = ("publish", "run-all")
+# run-all 이 detect 에 넘기는 기본 --limit. 사전 필터 뒤에도 전량 판정으로 흘러가지 않게 한다
+DEFAULT_DETECT_LIMIT = 300
 
 COLLECT_STAGES = ("news", "filings", "reports", "all")
 # reports 는 사람이 PDF 와 페이지 번호를 준다 — 이 인자가 전부 있어야 한다
@@ -516,10 +517,107 @@ def cmd_score(args: argparse.Namespace) -> int:
     return EXIT_ERROR if result.status == "failed" else EXIT_OK
 
 
-# --------------------------------------------------------------------------- 미구현 단계
-def cmd_not_implemented(args: argparse.Namespace) -> int:
-    print(f"{args.command}: P5~P6에서 구현", file=sys.stderr)
-    return EXIT_NOT_IMPLEMENTED
+# --------------------------------------------------------------------------- publish (F-06)
+def _print_publish(result) -> None:
+    stats = result.stats
+    grades = " ".join(f"{name}={count}" for name, count in stats["grades"].items())
+    print(
+        f"\npublish: run={result.run_id} status={result.status} company={stats['company']} targets={stats['targets']} "
+        f"llm_calls={stats['llm_calls']} cache_hits={stats['cache_hits']} regenerated={stats['regenerated']} "
+        f"published={stats['published']} [{grades}] capped={stats['capped']} discarded={stats['discarded']} "
+        f"length_noted={stats['length_noted']} skipped_existing={stats['skipped_existing']} errors={len(stats['errors'])}"
+    )
+    _print_errors(stats["errors"])
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from esg_watchdog.services.publish.alerts import publish_alerts
+
+    try:
+        result = publish_alerts(stock_code=args.company)
+    except (LookupError, ValueError, RuntimeError, SQLAlchemyError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    _print_publish(result)
+    return EXIT_ERROR if result.status == "failed" else EXIT_OK
+
+
+# --------------------------------------------------------------------------- run-all
+RUN_ALL_STAGES = ("collect_news", "collect_filings", "extract", "detect", "match", "score", "publish")
+RUN_ALL_STAGE = "run-all"
+# 단계 결과 status 가 이 값이면 중단한다. partial 은 경고만 하고 계속 간다
+STOP_STATUSES = ("failed", "skipped")
+
+
+def _run_all_stage(name: str, args: argparse.Namespace):
+    """단계 하나 실행 → 결과 객체(run_id · status · stats). 예외는 호출자가 잡는다."""
+    if name == "collect_news":
+        from esg_watchdog.services.collect.news import collect_news
+
+        return collect_news(stock_code=args.company)
+    if name == "collect_filings":
+        from esg_watchdog.services.collect.filings import collect_filings
+
+        return collect_filings(stock_code=args.company)
+    if name == "extract":
+        from esg_watchdog.services.extract.commitments import extract_commitments
+
+        return extract_commitments(stock_code=args.company)
+    if name == "detect":
+        from esg_watchdog.services.detect.events import detect_events
+
+        return detect_events(stock_code=args.company, limit=args.detect_limit)
+    if name == "match":
+        from esg_watchdog.services.match.judge import match_events
+
+        return match_events(stock_code=args.company)
+    if name == "score":
+        from esg_watchdog.services.score.apply import apply_scores
+
+        return apply_scores(stock_code=args.company)
+    from esg_watchdog.services.publish.alerts import publish_alerts
+
+    return publish_alerts(stock_code=args.company)
+
+
+def cmd_run_all(args: argparse.Namespace) -> int:
+    """collect news → filings → extract → detect → match → score → publish. 한 단계가 failed/skipped 이거나 예외면 중단."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from esg_watchdog.services.runs import finish_run, start_run
+
+    run_id = start_run(RUN_ALL_STAGE)
+    stats: dict = {"company": args.company, "detect_limit": args.detect_limit, "stages": {}, "stopped_at": None}
+    print(f"[run-all] run={run_id} company={args.company} detect_limit={args.detect_limit} 순서: {' → '.join(RUN_ALL_STAGES)}")
+
+    stopped_at: str | None = None
+    for name in RUN_ALL_STAGES:
+        print(f"\n===== [{name}] =====")
+        try:
+            result = _run_all_stage(name, args)
+        except (LookupError, ValueError, RuntimeError, FileNotFoundError, OSError, SQLAlchemyError) as exc:
+            stats["stages"][name] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            print(f"ERROR [{name}]: {type(exc).__name__}: {exc}", file=sys.stderr)
+            stopped_at = name
+            break
+        stats["stages"][name] = {"run_id": result.run_id, "status": result.status}
+        print(f"[{name}] run={result.run_id} status={result.status}")
+        if result.status in STOP_STATUSES:
+            stopped_at = name
+            break
+        if result.status == "partial":
+            print(f"WARN [{name}]: partial — 일부 단위가 실패했지만 다음 단계로 진행한다")
+
+    stats["stopped_at"] = stopped_at
+    finish_run(run_id, "failed" if stopped_at else "success", stats, f"중단: {stopped_at}" if stopped_at else None)
+    done = [name for name in RUN_ALL_STAGES if name in stats["stages"] and name != stopped_at]
+    if stopped_at:
+        print(f"\nrun-all: run={run_id} 중단 — [{stopped_at}] 단계에서 멈췄다 (완료: {', '.join(done) or '-'}). 위 오류를 고치고 다시 실행하라.")
+        return EXIT_ERROR
+    print(f"\nrun-all: run={run_id} 완료 — {' → '.join(done)}")
+    return EXIT_OK
 
 
 # --------------------------------------------------------------------------- parser
@@ -612,9 +710,34 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("--company", metavar="STOCK_CODE", help="한 회사만 (기본: 전체)")
     score.set_defaults(func=cmd_score)
 
-    for name in PENDING_COMMANDS:
-        pending = subparsers.add_parser(name, help="P5~P6에서 구현")
-        pending.set_defaults(func=cmd_not_implemented)
+    publish = subparsers.add_parser(
+        "publish",
+        help="F-06 경보 발행: accepted 매칭(위반·후퇴·이행지연, scores 있음) → 등급 · 4단락 설명문 · 금지어 필터 → alerts (LLM_MODEL_JUDGE 필요, fake 가능)",
+        description=(
+            "F-06 경보 발행. 등급은 GRADE_THRESHOLDS, 미확정 사건은 '주의' 캡. LLM 설명문 → 금지어 검사(걸리면 재생성 1회, 재발 시 폐기+note) "
+            "→ 길이 400~800자(벗어나면 재생성 1회, 재발 시 채택+note) → alerts(match_id UNIQUE)."
+        ),
+    )
+    publish.add_argument("--company", metavar="STOCK_CODE", help="한 회사만 (기본: 전체)")
+    publish.set_defaults(func=cmd_publish)
+
+    run_all = subparsers.add_parser(
+        "run-all",
+        help="한 회사 전 단계: collect news · filings → extract → detect → match → score → publish. 한 단계 실패 시 중단",
+        description=(
+            "collect news → collect filings → extract → detect → match → score → publish 를 순서대로 실행한다. "
+            "한 단계가 failed/skipped 이거나 예외면 그 자리에서 멈추고 어디서 멈췄는지 출력한다. pipeline_runs 에 stage=run-all 로도 남긴다."
+        ),
+    )
+    run_all.add_argument("--company", metavar="STOCK_CODE", required=True, help="한 회사")
+    run_all.add_argument(
+        "--detect-limit",
+        type=int,
+        default=DEFAULT_DETECT_LIMIT,
+        metavar="N",
+        help=f"detect 단계에 넘기는 --limit (기본 {DEFAULT_DETECT_LIMIT}). 전량 판정으로 흘러가지 않게 한다",
+    )
+    run_all.set_defaults(func=cmd_run_all)
 
     return parser
 
