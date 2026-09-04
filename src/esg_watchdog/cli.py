@@ -6,7 +6,8 @@
 - extract --company <code> | --document <id> (F-02): document_pages → commitments. LLM 은 배치에서만 부른다
 - detect --company <code> [--limit N] [--yes] [--all] (F-03): articles → events. 사전 필터 통과 M건 → 배치 K회를 먼저 출력, 200건 초과는 --yes 필요
 - match --company <code> (F-04): 후보 SQL → LLM 관계 판정 → matches
-- score · publish · run-all 은 등록만 하고 P6 에서 채운다.
+- score [--company <code>] (F-05): matches.scores 전체 재계산 (LLM 없음, D-15)
+- publish · run-all 은 등록만 하고 P6 에서 채운다.
 DB 엔진·boto3 등 무거운 import 는 서브커맨드 함수 안에서만 한다 (--help 와 import 는 .env 없이 동작).
 pipeline_runs.trigger 는 전부 'manual' (cron 없음).
 """
@@ -22,7 +23,7 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NOT_IMPLEMENTED = 2
 
-PENDING_COMMANDS = ("score", "publish", "run-all")
+PENDING_COMMANDS = ("publish", "run-all")
 
 COLLECT_STAGES = ("news", "filings", "reports", "all")
 # reports 는 사람이 PDF 와 페이지 번호를 준다 — 이 인자가 전부 있어야 한다
@@ -495,6 +496,26 @@ def cmd_match(args: argparse.Namespace) -> int:
     return EXIT_ERROR if result.status == "failed" else EXIT_OK
 
 
+# --------------------------------------------------------------------------- score (F-05)
+def cmd_score(args: argparse.Namespace) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from esg_watchdog.services.score.apply import apply_scores
+
+    try:
+        result = apply_scores(stock_code=args.company)
+    except (LookupError, ValueError, RuntimeError, SQLAlchemyError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    stats = result.stats
+    print(
+        f"\nscore: run={result.run_id} status={result.status} company={stats['company']} matches={stats['matches']} "
+        f"scored={stats['scored']} materiality_zero={stats['materiality_zero']} errors={len(stats['errors'])}"
+    )
+    _print_errors(stats["errors"])
+    return EXIT_ERROR if result.status == "failed" else EXIT_OK
+
+
 # --------------------------------------------------------------------------- 미구현 단계
 def cmd_not_implemented(args: argparse.Namespace) -> int:
     print(f"{args.command}: P5~P6에서 구현", file=sys.stderr)
@@ -582,6 +603,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     match.add_argument("--company", metavar="STOCK_CODE", required=True, help="한 회사")
     match.set_defaults(func=cmd_match)
+
+    score = subparsers.add_parser(
+        "score",
+        help="F-05 점수: matches.scores 전체 재계산 (LLM 없음). 가중치(knowledge/weights.py)를 바꾸면 다시 실행 (D-15)",
+        description="F-05 점수. 회사(또는 전체) matches 를 전부 다시 계산해 scores{materiality, confidence, components} 에 저장. 부분 재계산 없음.",
+    )
+    score.add_argument("--company", metavar="STOCK_CODE", help="한 회사만 (기본: 전체)")
+    score.set_defaults(func=cmd_score)
 
     for name in PENDING_COMMANDS:
         pending = subparsers.add_parser(name, help="P5~P6에서 구현")
