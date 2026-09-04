@@ -4,7 +4,8 @@
 - collect --stage news|filings|reports|all (F-01). all = news → filings. reports 는 --pdf 등 인자가 필요해 all 에 없다
 - collect-krx: KRX 자동 수집(S3 업로드) 옵션 경로 — all 에 포함하지 않는다 (D-28)
 - extract --company <code> | --document <id> (F-02): document_pages → commitments. LLM 은 배치에서만 부른다
-- detect --company <code> [--limit N] [--yes] [--all] (F-03): articles → events. 사전 필터 통과 M건 → 배치 K회를 먼저 출력, 200건 초과는 --yes 필요
+- detect --company <code> [--limit N] [--since D] [--until D] [--yes] [--all] (F-03): articles → events. 사전 필터 통과 M건 → 배치 K회 ·
+  처리 구간을 먼저 출력, 200건 초과는 --yes 필요. --since/--until 은 published_at(KST 날짜) 창, 기본은 최근 12개월 전체
 - match --company <code> (F-04): 후보 SQL → LLM 관계 판정 → matches
 - score [--company <code>] (F-05): matches.scores 전체 재계산 (LLM 없음, D-15)
 - publish [--company <code>] (F-06): accepted 매칭 → 등급 · 설명문 · 금지어 필터 → alerts
@@ -456,16 +457,20 @@ def cmd_detect(args: argparse.Namespace) -> int:
     from esg_watchdog.services.detect.events import detect_events
 
     try:
-        result = detect_events(stock_code=args.company, limit=args.limit, yes=args.yes, all_articles=args.all)
+        result = detect_events(
+            stock_code=args.company, limit=args.limit, yes=args.yes, all_articles=args.all, since=args.since, until=args.until
+        )
     except (LookupError, ValueError, RuntimeError, SQLAlchemyError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return EXIT_ERROR
     if result.status == "skipped":
         return EXIT_ERROR
     stats = result.stats
+    coverage = stats.get("coverage")
+    coverage_text = f"{coverage['from']}~{coverage['to']}" if coverage else "-"
     print(
         f"\ndetect: run={result.run_id} status={result.status} pending={stats['pending']} prefiltered={stats['prefiltered']} "
-        f"articles={stats['articles']} batches={stats['batches']} "
+        f"articles={stats['articles']} batches={stats['batches']} coverage={coverage_text} "
         f"llm_calls={stats['llm_calls']} cache_hits={stats['cache_hits']} regenerated={stats['regenerated']} "
         f"judged={stats['judged']} not_event={stats['not_event']} not_subject={stats['not_subject']} "
         f"candidates={stats['candidates']} inserted={stats['inserted']} merged={stats['merged']} "
@@ -679,14 +684,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     detect = subparsers.add_parser(
         "detect",
-        help="F-03 사건 탐지: pending 기사(12개월) → events (LLM_PROVIDER · LLM_MODEL_EXTRACT 필요, fake 가능)",
+        help="F-03 사건 탐지: pending 기사(기본 12개월, --since/--until 로 조정) → events (LLM_PROVIDER · LLM_MODEL_EXTRACT 필요, fake 가능)",
         description=(
             "F-03 사건 탐지. 사전 필터(제목에 ESG 키워드·회사 extra_keywords) → 15건 배치 LLM 호출 → 인용 검사(실패 시 재생성 1회) "
-            "→ 중복 병합(기존 events 포함) → events. 처리한 기사는 processed, 필터에 걸러진 기사는 pending 유지."
+            "→ 중복 병합(키: category · event_type · 연-월, 기존 events 포함) → events. 처리한 기사는 processed, 필터에 걸러진 기사는 pending 유지. "
+            "첫 줄에 실제 처리 구간(배치에 든 기사의 published_at 최소~최대)을 출력한다."
         ),
     )
     detect.add_argument("--company", metavar="STOCK_CODE", required=True, help="한 회사")
     detect.add_argument("--limit", type=int, metavar="N", help="처리할 기사 수 상한 (필터 통과분 중 오래된 것부터)")
+    detect.add_argument("--since", type=_to_date, metavar="YYYY-MM-DD", help="이 날짜(published_at, KST)부터. 기본: 최근 12개월")
+    detect.add_argument("--until", type=_to_date, metavar="YYYY-MM-DD", help="이 날짜(published_at, KST)까지, 그 날 포함. 기본: 상한 없음")
     detect.add_argument("--yes", action="store_true", help="--limit 없이 필터 통과 기사가 200건을 넘어도 실행")
     detect.add_argument("--all", action="store_true", help="사전 필터를 끄고 pending 기사 전부를 판정 대상으로")
     detect.set_defaults(func=cmd_detect)
