@@ -142,7 +142,7 @@ def test_duplicate_normalized_text_is_skipped_not_merged(tmp_path):
 
 # --------------------------------------------------------------------------- 프롬프트
 def test_prompt_and_schema_shape():
-    assert PROMPT_VERSION == "f02-v1"
+    assert PROMPT_VERSION == "f02-v2"
     prompt = build_user_prompt("KT", 3, "본문", failed_quotes=["없는 문장"])
     assert "회사: KT" in prompt and "페이지: 3" in prompt and "본문" in prompt
     assert "- 없는 문장" in prompt and "원문 그대로 인용하세요" in prompt
