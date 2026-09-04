@@ -15,7 +15,7 @@ from datetime import date
 from pathlib import Path
 
 from esg_watchdog.parsers.pdf import count_pages, extract_pages
-from esg_watchdog.services.collect import finish_run, start_run
+from esg_watchdog.services.runs import finish_run, start_run
 
 STAGE = "collect_reports"
 # D-10: 뉴스 창(오늘−12개월) 시작. 이보다 늦게 발간된 보고서는 공약 이후 사건이 거의 없어 매칭이 0~1건으로 붕괴할 수 있다

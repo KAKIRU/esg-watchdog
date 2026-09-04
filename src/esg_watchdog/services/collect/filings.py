@@ -14,7 +14,7 @@ from datetime import date, timedelta
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 
-from esg_watchdog.services.collect import (
+from esg_watchdog.services.runs import (
     decide_status,
     failure_note,
     finish_run,

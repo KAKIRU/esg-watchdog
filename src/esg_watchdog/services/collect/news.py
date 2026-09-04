@@ -29,7 +29,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from esg_watchdog.knowledge.keywords import ALL_KEYWORDS, COMPANIES
-from esg_watchdog.services.collect import (
+from esg_watchdog.services.runs import (
     KST,
     decide_status,
     failure_note,
