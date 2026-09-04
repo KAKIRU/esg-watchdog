@@ -58,11 +58,11 @@ class AnthropicProvider:
             message = self._client.messages.create(
                 model=model,
                 max_tokens=self._max_tokens,
-                temperature=0,
                 system=system,
                 messages=[{"role": "user", "content": user}],
                 tools=[tool],
                 tool_choice={"type": "tool", "name": tool_name, "disable_parallel_tool_use": True},
+                extra_body={"temperature": 0},
             )
         except sdk.APIConnectionError as exc:  # APITimeoutError 포함
             raise TransientProviderError(f"anthropic 연결/타임아웃: {exc}") from exc
