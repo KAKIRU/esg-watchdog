@@ -4,7 +4,8 @@
 - collect --stage news|filings|reports|all (F-01). all = news → filings. reports 는 --pdf 등 인자가 필요해 all 에 없다
 - collect-krx: KRX 자동 수집(S3 업로드) 옵션 경로 — all 에 포함하지 않는다 (D-28)
 - extract --company <code> | --document <id> (F-02): document_pages → commitments. LLM 은 배치에서만 부른다
-- detect · match · score · publish · run-all 은 등록만 하고 P5~P6 에서 채운다.
+- detect --company <code> [--limit N] [--yes] (F-03): articles → events. 기사 N건 → 배치 M회를 먼저 출력, 200건 초과는 --yes 필요
+- match · score · publish · run-all 은 등록만 하고 P6 에서 채운다.
 DB 엔진·boto3 등 무거운 import 는 서브커맨드 함수 안에서만 한다 (--help 와 import 는 .env 없이 동작).
 pipeline_runs.trigger 는 전부 'manual' (cron 없음).
 """
@@ -20,7 +21,7 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NOT_IMPLEMENTED = 2
 
-PENDING_COMMANDS = ("detect", "match", "score", "publish", "run-all")
+PENDING_COMMANDS = ("match", "score", "publish", "run-all")
 
 COLLECT_STAGES = ("news", "filings", "reports", "all")
 # reports 는 사람이 PDF 와 페이지 번호를 준다 — 이 인자가 전부 있어야 한다
@@ -445,6 +446,31 @@ def cmd_extract(args: argparse.Namespace) -> int:
     return EXIT_ERROR if result.status == "failed" else EXIT_OK
 
 
+# --------------------------------------------------------------------------- detect (F-03)
+def cmd_detect(args: argparse.Namespace) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from esg_watchdog.services.detect.events import detect_events
+
+    try:
+        result = detect_events(stock_code=args.company, limit=args.limit, yes=args.yes)
+    except (LookupError, ValueError, RuntimeError, SQLAlchemyError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if result.status == "skipped":
+        return EXIT_ERROR
+    stats = result.stats
+    print(
+        f"\ndetect: run={result.run_id} status={result.status} articles={stats['articles']} batches={stats['batches']} "
+        f"llm_calls={stats['llm_calls']} cache_hits={stats['cache_hits']} regenerated={stats['regenerated']} "
+        f"judged={stats['judged']} not_event={stats['not_event']} not_subject={stats['not_subject']} "
+        f"candidates={stats['candidates']} inserted={stats['inserted']} merged={stats['merged']} "
+        f"discarded={stats['discarded']} demoted={stats['demoted']} processed={stats['processed']} errors={len(stats['errors'])}"
+    )
+    _print_errors(stats["errors"])
+    return EXIT_ERROR if result.status == "failed" else EXIT_OK
+
+
 # --------------------------------------------------------------------------- 미구현 단계
 def cmd_not_implemented(args: argparse.Namespace) -> int:
     print(f"{args.command}: P5~P6에서 구현", file=sys.stderr)
@@ -507,6 +533,16 @@ def build_parser() -> argparse.ArgumentParser:
     extract_target.add_argument("--company", metavar="STOCK_CODE", help="그 회사 documents 전부")
     extract_target.add_argument("--document", type=int, metavar="ID", help="documents.id 하나")
     extract.set_defaults(func=cmd_extract)
+
+    detect = subparsers.add_parser(
+        "detect",
+        help="F-03 사건 탐지: pending 기사(12개월) → events (LLM_PROVIDER · LLM_MODEL_EXTRACT 필요, fake 가능)",
+        description="F-03 사건 탐지. 15건 배치 LLM 호출 → 인용 검사(실패 시 재생성 1회) → 중복 병합(기존 events 포함) → events. 처리한 기사는 processed.",
+    )
+    detect.add_argument("--company", metavar="STOCK_CODE", required=True, help="한 회사")
+    detect.add_argument("--limit", type=int, metavar="N", help="처리할 기사 수 상한 (오래된 것부터)")
+    detect.add_argument("--yes", action="store_true", help="--limit 없이 기사가 200건을 넘어도 실행")
+    detect.set_defaults(func=cmd_detect)
 
     for name in PENDING_COMMANDS:
         pending = subparsers.add_parser(name, help="P5~P6에서 구현")
