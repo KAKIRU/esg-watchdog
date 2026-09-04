@@ -1,7 +1,7 @@
 """
 Optional FastAPI adapter for ESGWatchdog.
 
-The primary execution path is the batch/CLI pipeline under `jobs`.
+The primary execution path is the batch pipeline run by the `esg-watchdog` CLI (src/esg_watchdog/cli.py).
 Keep this module only as an optional HTTP adapter and health-check endpoint.
 
 Do not add business or pipeline routes here.
