@@ -31,6 +31,10 @@ DISCLAIMER = (
 )
 VIEWS = ("feed", "company", "alert")
 UNCONFIRMED_BADGE = "조사·의혹 단계 — 등급 상한 '주의'"
+# scores.components 표시 순서 (D-31: esg_watchdog 를 import 하지 않으므로 여기 둔다). jsonb 는 키 순서를 보존하지 않는다 —
+# DB 모드에서 막대가 매번 다른 순서로 그려지지 않게 고정한다. 목록에 없는 키는 뒤에 알파벳순.
+COMPONENT_ORDER = ("industry_weight", "severity", "relation_coef", "confirmed_coef")
+COMPONENT_RANK = {key: rank for rank, key in enumerate(COMPONENT_ORDER)}
 
 
 # --------------------------------------------------------------------------- 표시 도우미
@@ -108,6 +112,14 @@ def score_bar(label: str, value: Any) -> None:
         st.markdown(f"{label} · —")
         return
     st.progress(bar, text=f"{label} · {fmt_number(value)}")
+
+
+def ordered_components(components: dict) -> list[tuple[str, Any]]:
+    """COMPONENT_ORDER 순서로, 목록에 없는 키는 뒤에 알파벳순으로."""
+    return sorted(
+        ((str(key), value) for key, value in components.items()),
+        key=lambda item: (COMPONENT_RANK.get(item[0], len(COMPONENT_ORDER)), item[0]),
+    )
 
 
 # --------------------------------------------------------------------------- 라우팅 (session_state 는 UI 상태만)
@@ -356,8 +368,8 @@ def render_alert(alert_id: Any) -> None:
     components = scores.get("components")
     if isinstance(components, dict) and components:
         st.caption("구성 요소")
-        for key, value in components.items():  # 키 순회 — 키를 하드코딩하지 않는다
-            score_bar(str(key), value)
+        for key, value in ordered_components(components):  # 고정 순서 — 모르는 키도 버리지 않고 뒤에 붙인다
+            score_bar(key, value)
 
     st.divider()
     st.caption(DISCLAIMER)

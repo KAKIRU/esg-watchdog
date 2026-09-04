@@ -1,6 +1,7 @@
 """streamlit_app.py — DATABASE_URL 없이 AppTest 로 3화면을 렌더한다 (fixture 모드)."""
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,13 @@ from streamlit.testing.v1 import AppTest
 
 # 이 테스트는 fixture 모드여야 한다. 앱이 lib/data.py 를 import 하기 전에 지운다
 os.environ.pop("DATABASE_URL", None)
-APP_FILE = Path(__file__).resolve().parents[2] / "app" / "streamlit_app.py"
+APP_DIR = Path(__file__).resolve().parents[2] / "app"
+APP_FILE = APP_DIR / "streamlit_app.py"
+# 앱 스크립트가 `from lib import data` 로 읽는 모듈과 같은 객체를 잡아 monkeypatch 한다
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+
+from lib import data
 
 TEXT_ACCESSORS = ("title", "subheader", "markdown", "caption", "info", "warning", "error", "success", "text")
 
@@ -152,3 +159,24 @@ def test_query_param_codes_filters_feed(app: AppTest):
     at.button(key="clear-codes").click().run()
     assert not at.exception
     assert "보유 종목 필터 적용중" not in page_text(at)
+
+
+def test_alert_components_render_in_fixed_order_regardless_of_dict_order(app: AppTest, monkeypatch):
+    """jsonb 는 키 순서를 보존하지 않는다 — 뒤섞인 dict 도 industry_weight → severity → relation_coef → confirmed_coef, 모르는 키는 뒤에 알파벳순."""
+    real_detail = data.get_alert_detail
+
+    def shuffled_detail(alert_id):
+        detail = real_detail(alert_id)
+        detail["match"]["scores"] = {
+            **detail["match"]["scores"],
+            "components": {"zeta_extra": 0.5, "confirmed_coef": 1.0, "severity": 53, "alpha_extra": 0.3, "relation_coef": 1.0, "industry_weight": 30},
+        }
+        return detail
+
+    monkeypatch.setattr(data, "get_alert_detail", shuffled_detail)
+    app.session_state["view"] = "alert"
+    app.session_state["alert_id"] = 4001
+    at = app.run()
+    assert not at.exception
+    labels = [str(node.proto.text).split(" · ")[0] for node in at.get("progress")]
+    assert labels == ["중대성", "신뢰도", "industry_weight", "severity", "relation_coef", "confirmed_coef", "alpha_extra", "zeta_extra"]
