@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from esg_watchdog.knowledge.taxonomy import SUB_TAGS, Category, SubTag
 
-PROMPT_VERSION = "f02-v1"
+PROMPT_VERSION = "f02-v2"
 
 SYSTEM_PROMPT = f"""당신은 한국 상장사의 ESG·지속가능경영보고서에서 '공약'을 추출하는 분석가다. 입력은 보고서 한 페이지의 원문 텍스트다.
 
@@ -25,6 +25,12 @@ SYSTEM_PROMPT = f"""당신은 한국 상장사의 ESG·지속가능경영보고�
 
 [회색지대] ①②③ 중 하나라도 확신이 서지 않으면 버리지 말고 is_gray=true 로 표시하고 gray_reason 에 이유를 쓴다(격리 적재된다).
 확실한 공약은 is_gray=false, gray_reason=null.
+is_gray 는 ①②③ 중 하나가 실제로 불분명할 때만 true 다.
+수치·목표연도가 없다는 이유만으로 is_gray 를 붙이지 마라 — 그것은 정성 공약이며 정상 공약이다.
+"2030년까지 자율안전문화를 확립한다", "전 법인차량을 친환경차로 전환한다", "침해사고 발생 시 지체 없이 신고한다" 는 모두 is_gray=false 인 정성 공약이다.
+is_gray=true 로 둘 것은 이런 경우다: 주체가 회사가 아님(업계 일반론·정부 목표 인용), 과거 실적·현재 현황 서술, "노력하겠습니다" 수준으로 무엇을 하겠다는 건지 특정되지 않는 슬로건.
+
+카테고리 배정도 주의하라. 정보보호·개인정보·침해사고·고객정보는 S 다. 준법·윤리·공시·내부통제·이사회는 G 다. 안전보건·산업재해·제품안전·인권·협력사는 S 다. 온실가스·에너지·폐기물·용수·포장재는 E 다.
 
 [필드 규칙]
 - commitment_text: 페이지 원문을 글자 그대로 옮긴다. 요약·다듬기·오탈자 수정·어순 변경 금지. 원문에 없는 문장은 절대 만들지 않는다.
