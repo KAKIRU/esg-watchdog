@@ -4,8 +4,9 @@
 - collect --stage news|filings|reports|all (F-01). all = news → filings. reports 는 --pdf 등 인자가 필요해 all 에 없다
 - collect-krx: KRX 자동 수집(S3 업로드) 옵션 경로 — all 에 포함하지 않는다 (D-28)
 - extract --company <code> | --document <id> (F-02): document_pages → commitments. LLM 은 배치에서만 부른다
-- detect --company <code> [--limit N] [--yes] (F-03): articles → events. 기사 N건 → 배치 M회를 먼저 출력, 200건 초과는 --yes 필요
-- match · score · publish · run-all 은 등록만 하고 P6 에서 채운다.
+- detect --company <code> [--limit N] [--yes] [--all] (F-03): articles → events. 사전 필터 통과 M건 → 배치 K회를 먼저 출력, 200건 초과는 --yes 필요
+- match --company <code> (F-04): 후보 SQL → LLM 관계 판정 → matches
+- score · publish · run-all 은 등록만 하고 P6 에서 채운다.
 DB 엔진·boto3 등 무거운 import 는 서브커맨드 함수 안에서만 한다 (--help 와 import 는 .env 없이 동작).
 pipeline_runs.trigger 는 전부 'manual' (cron 없음).
 """
@@ -21,7 +22,7 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NOT_IMPLEMENTED = 2
 
-PENDING_COMMANDS = ("match", "score", "publish", "run-all")
+PENDING_COMMANDS = ("score", "publish", "run-all")
 
 COLLECT_STAGES = ("news", "filings", "reports", "all")
 # reports 는 사람이 PDF 와 페이지 번호를 준다 — 이 인자가 전부 있어야 한다
@@ -472,6 +473,28 @@ def cmd_detect(args: argparse.Namespace) -> int:
     return EXIT_ERROR if result.status == "failed" else EXIT_OK
 
 
+# --------------------------------------------------------------------------- match (F-04)
+def cmd_match(args: argparse.Namespace) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from esg_watchdog.services.match.judge import match_events
+
+    try:
+        result = match_events(stock_code=args.company)
+    except (LookupError, ValueError, RuntimeError, SQLAlchemyError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    stats = result.stats
+    relations = " ".join(f"{name}={count}" for name, count in stats["relations"].items())
+    print(
+        f"\nmatch: run={result.run_id} status={result.status} candidates={stats['candidates']} llm_calls={stats['llm_calls']} "
+        f"cache_hits={stats['cache_hits']} regenerated={stats['regenerated']} judged={stats['judged']} upserted={stats['upserted']} "
+        f"[{relations}] enforced={stats['enforced']} discarded={stats['discarded']} errors={len(stats['errors'])}"
+    )
+    _print_errors(stats["errors"])
+    return EXIT_ERROR if result.status == "failed" else EXIT_OK
+
+
 # --------------------------------------------------------------------------- 미구현 단계
 def cmd_not_implemented(args: argparse.Namespace) -> int:
     print(f"{args.command}: P5~P6에서 구현", file=sys.stderr)
@@ -548,6 +571,17 @@ def build_parser() -> argparse.ArgumentParser:
     detect.add_argument("--yes", action="store_true", help="--limit 없이 필터 통과 기사가 200건을 넘어도 실행")
     detect.add_argument("--all", action="store_true", help="사전 필터를 끄고 pending 기사 전부를 판정 대상으로")
     detect.set_defaults(func=cmd_detect)
+
+    match = subparsers.add_parser(
+        "match",
+        help="F-04 매칭: 후보 SQL(같은 기업·category · 0<gap≤24) → LLM 관계 판정 → matches (LLM_PROVIDER · LLM_MODEL_JUDGE 필요, fake 가능)",
+        description=(
+            "F-04 관계 판정. 후보마다 LLM 1회 → 인용 검사(실패 시 재생성 1회) → target_year 미도래 '위반' 은 '이행지연' 으로 강제 "
+            "→ matches(status accepted, scores 는 score 단계가 채움). '무관' 도 저장해 재판정하지 않는다."
+        ),
+    )
+    match.add_argument("--company", metavar="STOCK_CODE", required=True, help="한 회사")
+    match.set_defaults(func=cmd_match)
 
     for name in PENDING_COMMANDS:
         pending = subparsers.add_parser(name, help="P5~P6에서 구현")
