@@ -1,6 +1,9 @@
 """F-03 사건 탐지 — articles → events (D-05 · D-07 · D-08 · D-36 · D-39).
 
-- 대상: 한 회사(--company)의 articles 중 status 'pending' · published_at 최근 12개월(article_companies 로 연결). --limit N.
+- 대상: 한 회사(--company)의 articles 중 status 'pending' · published_at 최근 12개월(article_companies 로 연결).
+  사전 필터(D-01): title 에 ALL_KEYWORDS 또는 그 회사 extra_keywords(keywords_for) 중 하나가 들어간 기사만 배치에 넣는다 —
+  수집은 재현율을 위해 넓게 긁었지만(회사당 최대 22,000건) 전량 판정하면 배치가 1,900회가 된다. 걸러진 기사는 status 를
+  바꾸지 않는다(--all 로 필터를 끄면 다시 대상이 된다). --limit N 은 필터 통과분에 적용한다(오래된 것부터).
   BATCH_SIZE(15)건씩 LLM(llm_model_extract) 배치 → is_esg_event 이고 is_subject 인 것만 사건 후보.
 - 인용 검사: quote_in(evidence_quote, title + " " + description). 실패(또는 필수 필드 누락)한 기사만 힌트를 붙여 1회 재생성 →
   재실패는 폐기하고 pipeline_runs.note 에 남긴다. 스키마 검증 실패(ValueError)도 같은 재생성 1회.
@@ -11,7 +14,8 @@
   thin_source(source_count == 1) · filing_ids 만 갱신하고, 기존 행의 title · summary · evidence_quote 는 덮어쓰지 않는다.
 - filing_ids(best-effort): 같은 회사 filings 중 |filed_at − reported_at| ≤ 14일이고 title 에 FILING_KEYWORDS 가 들어가면 붙인다.
 - 처리한 기사는 사건이 아니어도 status 'processed'. 배치 단위 예외 격리(실패 배치의 기사는 pending 유지).
-- 실행 전 "기사 N건 → LLM 배치 M회" 를 출력하고, --limit 없이 N > CONFIRM_LIMIT(200) 이면 --yes 없이는 실행하지 않는다.
+- 실행 첫 줄에 "pending N건 → 사전 필터 통과 M건 → 배치 K회" 를 출력하고, --limit 없이 M > CONFIRM_LIMIT(200) 이면 --yes 없이는
+  실행하지 않는다(가드는 필터 통과 후 건수 기준). stage_stats 에 pending · prefiltered(제외된 수) 를 남긴다.
 - pipeline_runs(stage='detect', trigger='manual'). DB·settings import 는 함수 안에서만 — .env 없이 import 가능.
 """
 
@@ -32,6 +36,7 @@ from esg_watchdog.prompts.event_detect import (
     EventBatch,
     build_user_prompt,
 )
+from esg_watchdog.services.collect.news import keywords_for
 from esg_watchdog.services.runs import (
     KST,
     decide_status,
@@ -149,6 +154,23 @@ class MergeOp:
 
 
 # --------------------------------------------------------------------------- 순수 함수
+def title_has_keyword(title: str, keywords: Sequence[str]) -> bool:
+    """제목에 키워드 중 하나가 부분 문자열로 있는가(대소문자 무시)."""
+    haystack = title.casefold()
+    return any(keyword and keyword.casefold() in haystack for keyword in keywords)
+
+
+def prefilter_articles(
+    articles: Sequence[ArticleInput], keywords: Sequence[str]
+) -> tuple[list[ArticleInput], list[ArticleInput]]:
+    """사전 필터(D-01): (제목에 키워드가 있는 기사, 걸러진 기사). 순서는 유지한다. 걸러진 기사는 status 를 건드리지 않는다."""
+    kept: list[ArticleInput] = []
+    excluded: list[ArticleInput] = []
+    for article in articles:
+        (kept if title_has_keyword(article.title, keywords) else excluded).append(article)
+    return kept, excluded
+
+
 def normalize_title_key(title: str, names: Sequence[str]) -> str:
     """앞 괄호 표식 제거 → 기업명·별칭 제거 → 소문자 → 한글·영숫자만 남긴다(공백·문장부호 제거)."""
     text = title
@@ -416,9 +438,11 @@ class DetectResult:
     stats: dict = field(default_factory=dict)
 
 
-def _new_stats(company: CompanyTarget, articles: int) -> dict:
+def _new_stats(company: CompanyTarget, articles: int, pending: int, prefiltered: int) -> dict:
     return {
         "company": company.stock_code,
+        "pending": pending,
+        "prefiltered": prefiltered,
         "articles": articles,
         "batches": batches_for(articles),
         "batches_failed": 0,
@@ -453,7 +477,8 @@ def _load_company(stock_code: str) -> CompanyTarget:
         return CompanyTarget(id=company.id, stock_code=company.stock_code, name=company.name, aliases=list(company.aliases or []))
 
 
-def _load_articles(company_id: int, since, limit: int | None) -> list[ArticleInput]:
+def _load_articles(company_id: int, since) -> list[ArticleInput]:
+    """그 회사의 pending 기사 전부(12개월). limit 은 사전 필터 뒤에 파이썬에서 적용한다."""
     from sqlalchemy import select
 
     from esg_watchdog.db import SessionLocal
@@ -466,8 +491,6 @@ def _load_articles(company_id: int, since, limit: int | None) -> list[ArticleInp
             .where(ArticleCompany.company_id == company_id, Article.status == "pending", Article.published_at >= since)
             .order_by(Article.published_at, Article.id)
         )
-        if limit is not None:
-            stmt = stmt.limit(limit)
         return [
             ArticleInput(
                 id=article.id,
@@ -559,12 +582,13 @@ def detect_events(
     stock_code: str,
     limit: int | None = None,
     yes: bool = False,
+    all_articles: bool = False,
     client: LLMClient | None = None,
     model: str | None = None,
     now=None,
     log: Log = print,
 ) -> DetectResult:
-    """사건 탐지 한 번 실행. 배치 단위로 예외를 격리하고 pipeline_runs 에 기록한다."""
+    """사건 탐지 한 번 실행. 배치 단위로 예외를 격리하고 pipeline_runs 에 기록한다. all_articles=True 면 사전 필터를 끈다."""
     from sqlalchemy.exc import SQLAlchemyError
 
     from esg_watchdog.db import SessionLocal
@@ -580,15 +604,28 @@ def detect_events(
 
     since = (now or now_kst()) - timedelta(days=WINDOW_DAYS)
     company = _load_company(stock_code)
-    articles = _load_articles(company.id, since, limit)
+    pending = _load_articles(company.id, since)
+    if all_articles:
+        passed, excluded = list(pending), []
+    else:
+        passed, excluded = prefilter_articles(pending, keywords_for(company.stock_code))
+    articles = passed[:limit] if limit is not None else passed
     batches = batches_for(len(articles))
-    log(f"[detect] {company.label}: 기사 {len(articles)}건 → LLM 배치 {batches}회 (since={since.date()}, limit={limit or '-'})")
+    limit_text = f" → --limit {len(articles)}건" if limit is not None and len(articles) < len(passed) else ""
+    log(
+        f"[detect] {company.label}: pending {len(pending)}건 → 사전 필터 통과 {len(passed)}건{limit_text} → 배치 {batches}회 "
+        f"(since={since.date()}, limit={limit or '-'}, 필터={'끔(--all)' if all_articles else '켬'})"
+    )
     if limit is None and len(articles) > CONFIRM_LIMIT and not yes:
-        log(f"기사가 {CONFIRM_LIMIT}건을 넘는다. --limit N 으로 줄이거나 --yes 로 확인하고 다시 실행하라. (실행하지 않음)")
-        return DetectResult(run_id=None, status="skipped", stats={"company": stock_code, "articles": len(articles), "batches": batches})
+        log(f"필터 통과 기사가 {CONFIRM_LIMIT}건을 넘는다. --limit N 으로 줄이거나 --yes 로 확인하고 다시 실행하라. (실행하지 않음)")
+        return DetectResult(
+            run_id=None,
+            status="skipped",
+            stats={"company": stock_code, "pending": len(pending), "prefiltered": len(excluded), "articles": len(articles), "batches": batches},
+        )
 
     run_id = start_run(STAGE)
-    stats = _new_stats(company, len(articles))
+    stats = _new_stats(company, len(articles), len(pending), len(excluded))
     notes: list[str] = []
     failed: list[str] = []
     calls_before, hits_before = client.stats["calls"], client.stats["cache_hits"]

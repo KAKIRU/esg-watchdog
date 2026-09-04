@@ -223,3 +223,64 @@ def test_batches_and_prompt_shape():
     judgement_schema = schema["$defs"]["ArticleJudgement"]
     assert judgement_schema["required"] == list(judgement_schema["properties"])
     assert "enum" not in judgement_schema["properties"]["event_type"]  # 택소노미 검증은 적재 직전 코드가 한다
+
+
+# --------------------------------------------------------------------------- 사전 필터 (D-01)
+def test_prefilter_keeps_only_titles_with_keyword_and_preserves_order():
+    keywords = ["화재", "위생", "시화공장"]
+    kept, excluded = svc.prefilter_articles([A1, A3, A2, A4], keywords)
+    assert [a.id for a in kept] == [105, 109, 111]  # A3(신제품 출시)는 제목에 키워드가 없다
+    assert [a.id for a in excluded] == [110]
+    # 설명에만 키워드가 있어도 제목 기준이라 걸러진다
+    only_description = ArticleInput(id=120, title="SPC삼립 1분기 실적 발표", description="시화공장 화재 여파", published_at=date(2026, 5, 1), press="x")
+    assert svc.prefilter_articles([only_description], keywords) == ([], [only_description])
+    # 대소문자 무시 · 빈 키워드 무시
+    assert svc.title_has_keyword("KT 서버 감염 사실 미신고", ["서버 감염"]) is True
+    assert svc.title_has_keyword("kt 랜섬웨어 피해", ["랜섬웨어", ""]) is True
+    assert svc.title_has_keyword("KT 신제품 출시", []) is False
+
+
+def test_prefiltered_articles_are_not_batched_and_keep_pending_status(tmp_path):
+    """걸러진 기사는 배치에 안 들어가고, _store_batch 의 status 갱신도 배치에 든 기사에만 미친다."""
+    from sqlalchemy.dialects import postgresql
+
+    from esg_watchdog.services.collect.news import keywords_for
+
+    keywords = keywords_for(COMPANY.stock_code)
+    kept, excluded = svc.prefilter_articles([A1, A2, A3, A4], keywords)
+    assert [a.id for a in kept] == [105, 109, 111]  # 화재(안전보건) · 논란(공통)
+    assert [a.id for a in excluded] == [110]
+
+    client, fake = make_client(tmp_path, [{"judgements": [judgement(105), judgement(109, evidence_quote="화재로 공장 전체 가동이 중단됐다"), judgement(111, is_subject=False, evidence_quote="위생 논란")]}])
+    outcome = svc.detect_batch(client, "m", COMPANY, kept, log=lambda _line: None)
+    assert "id=110" not in fake.calls[0]["user"] and "id=105" in fake.calls[0]["user"]
+
+    class RecordingSession:
+        def __init__(self):
+            self.statements = []
+            self.added = []
+
+        def add(self, obj):
+            self.added.append(obj)
+
+        def flush(self):
+            for index, obj in enumerate(self.added, start=1):
+                if getattr(obj, "id", None) is None:
+                    obj.id = 9000 + index
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    session = RecordingSession()
+    stats = svc._new_stats(COMPANY, len(kept), pending=4, prefiltered=len(excluded))
+    svc._store_batch(session, COMPANY, kept, outcome, [], [], stats)
+
+    updates = [
+        str(stmt.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+        for stmt in session.statements
+        if "UPDATE articles" in str(stmt)
+    ]
+    assert len(updates) == 1
+    assert "105" in updates[0] and "109" in updates[0] and "111" in updates[0]
+    assert "110" not in updates[0]  # 걸러진 기사는 pending 그대로
+    assert stats["processed"] == 3 and stats["pending"] == 4 and stats["prefiltered"] == 1

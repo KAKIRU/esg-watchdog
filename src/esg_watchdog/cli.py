@@ -453,7 +453,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
     from esg_watchdog.services.detect.events import detect_events
 
     try:
-        result = detect_events(stock_code=args.company, limit=args.limit, yes=args.yes)
+        result = detect_events(stock_code=args.company, limit=args.limit, yes=args.yes, all_articles=args.all)
     except (LookupError, ValueError, RuntimeError, SQLAlchemyError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return EXIT_ERROR
@@ -461,7 +461,8 @@ def cmd_detect(args: argparse.Namespace) -> int:
         return EXIT_ERROR
     stats = result.stats
     print(
-        f"\ndetect: run={result.run_id} status={result.status} articles={stats['articles']} batches={stats['batches']} "
+        f"\ndetect: run={result.run_id} status={result.status} pending={stats['pending']} prefiltered={stats['prefiltered']} "
+        f"articles={stats['articles']} batches={stats['batches']} "
         f"llm_calls={stats['llm_calls']} cache_hits={stats['cache_hits']} regenerated={stats['regenerated']} "
         f"judged={stats['judged']} not_event={stats['not_event']} not_subject={stats['not_subject']} "
         f"candidates={stats['candidates']} inserted={stats['inserted']} merged={stats['merged']} "
@@ -537,11 +538,15 @@ def build_parser() -> argparse.ArgumentParser:
     detect = subparsers.add_parser(
         "detect",
         help="F-03 사건 탐지: pending 기사(12개월) → events (LLM_PROVIDER · LLM_MODEL_EXTRACT 필요, fake 가능)",
-        description="F-03 사건 탐지. 15건 배치 LLM 호출 → 인용 검사(실패 시 재생성 1회) → 중복 병합(기존 events 포함) → events. 처리한 기사는 processed.",
+        description=(
+            "F-03 사건 탐지. 사전 필터(제목에 ESG 키워드·회사 extra_keywords) → 15건 배치 LLM 호출 → 인용 검사(실패 시 재생성 1회) "
+            "→ 중복 병합(기존 events 포함) → events. 처리한 기사는 processed, 필터에 걸러진 기사는 pending 유지."
+        ),
     )
     detect.add_argument("--company", metavar="STOCK_CODE", required=True, help="한 회사")
-    detect.add_argument("--limit", type=int, metavar="N", help="처리할 기사 수 상한 (오래된 것부터)")
-    detect.add_argument("--yes", action="store_true", help="--limit 없이 기사가 200건을 넘어도 실행")
+    detect.add_argument("--limit", type=int, metavar="N", help="처리할 기사 수 상한 (필터 통과분 중 오래된 것부터)")
+    detect.add_argument("--yes", action="store_true", help="--limit 없이 필터 통과 기사가 200건을 넘어도 실행")
+    detect.add_argument("--all", action="store_true", help="사전 필터를 끄고 pending 기사 전부를 판정 대상으로")
     detect.set_defaults(func=cmd_detect)
 
     for name in PENDING_COMMANDS:
