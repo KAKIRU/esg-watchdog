@@ -1,6 +1,7 @@
 """services/publish/alerts.py — 가짜 LLM 으로 금지어 → 재생성 → 폐기, 길이 재생성 → 채택+note, confirmed false → '주의' 캡, 미확정 limitation 강제,
 등급 임계값 60/45/30 · 발행 하한 30(미달은 대상 제외 + stage_stats.below_threshold), 사유별 재생성 예산(금지어 → 스키마 실패 → 성공이 살아남고
-같은 사유 두 번이면 폐기, stage_stats 사유별 분리), 같은 사건 억제(--per-event · 기존 alert 포함 · 억제된 match 는 accepted 유지) 을
+같은 사유 두 번이면 폐기, stage_stats 사유별 분리), 같은 사건 억제(--per-event · 기존 alert 포함 · 억제된 match 는 accepted 유지),
+근거 품질 게이트(출처 제목에 기업명·별칭이 하나도 없으면 제외 · --allow-unnamed-source 로 해제) 를
 DB 없이 검사한다 (D-08 · D-16 · D-17)."""
 
 from datetime import date, datetime
@@ -140,7 +141,7 @@ def test_below_threshold_targets_are_excluded_not_discarded_and_first_line_shows
     result = svc.publish_alerts(client=client, model="m", now=datetime(2026, 9, 5, 9, 0, tzinfo=KST), log=lines.append)
 
     assert lines[0] == (
-        "[publish] 전체: 대상 3건(하한 미달 제외 19건 · 같은 사건 억제 0건) → 등급 심각 1 · 경고 0 · 주의 2 "
+        "[publish] 전체: 대상 3건(하한 미달 제외 19건 · 기업 미언급 출처만 0건 · 같은 사건 억제 0건) → 등급 심각 1 · 경고 0 · 주의 2 "
         "(accepted · 위반/후퇴/이행지연 · materiality ≥ 30 · alert 없음 → LLM 호출 3회)"
     )
     assert len(fake.calls) == 3 and [values["grade"] for values in saved] == ["심각", "주의", "주의"]  # 45점 미확정 → 캡
@@ -151,7 +152,9 @@ def test_below_threshold_targets_are_excluded_not_discarded_and_first_line_shows
     assert result.status == "success" and finished["run_id"] == 77 and finished["stats"]["below_threshold"] == 19
     # 미리보기 헬퍼 — 대상이 없으면 전부 0
     assert svc.grade_counts([]) == {"주의": 0, "경고": 0, "심각": 0}
-    assert svc.targets_line("KT(030200)", [], 5, 2).startswith("[publish] KT(030200): 대상 0건(하한 미달 제외 5건 · 같은 사건 억제 2건) → 등급 심각 0 · 경고 0 · 주의 0")
+    assert svc.targets_line("KT(030200)", [], 5, 2, 1).startswith(
+        "[publish] KT(030200): 대상 0건(하한 미달 제외 5건 · 기업 미언급 출처만 1건 · 같은 사건 억제 2건) → 등급 심각 0 · 경고 0 · 주의 0"
+    )
 
 
 # --------------------------------------------------------------------------- 같은 사건 억제 (D-16)
@@ -193,7 +196,7 @@ def test_suppress_same_event_counts_existing_alerts_in_db():
     assert lines[0].startswith("[publish] 같은 사건 억제(--per-event 1): event 2005 → 남김 기존 alert · 억제 3011(71) · 3013(71) · 3012(65)")
 
 
-def publish_with(monkeypatch, tmp_path, *, targets, existing, per_event, responses):
+def publish_with(monkeypatch, tmp_path, *, targets, existing, per_event, responses, allow_unnamed_source=False):
     lines: list[str] = []
     saved: list[dict] = []
     finished: dict = {}
@@ -202,7 +205,10 @@ def publish_with(monkeypatch, tmp_path, *, targets, existing, per_event, respons
     monkeypatch.setattr(svc, "finish_run", lambda run_id, status, stats, note=None: finished.update(stats=stats, note=note))
     monkeypatch.setattr(svc, "_insert_alert", lambda values: saved.append(values) or True)
     client, fake = make_client(tmp_path, responses)
-    result = svc.publish_alerts(stock_code="005610", client=client, model="m", now=datetime(2026, 9, 5, 9, 0, tzinfo=KST), per_event=per_event, log=lines.append)
+    result = svc.publish_alerts(
+        stock_code="005610", client=client, model="m", now=datetime(2026, 9, 5, 9, 0, tzinfo=KST),
+        per_event=per_event, allow_unnamed_source=allow_unnamed_source, log=lines.append,
+    )
     return result, lines, saved, fake, finished
 
 
@@ -210,7 +216,9 @@ def test_publish_suppresses_same_event_and_reports_it(monkeypatch, tmp_path):
     result, lines, saved, fake, finished = publish_with(
         monkeypatch, tmp_path / "one", targets=same_event_targets(), existing={}, per_event=1, responses=[explanation(), explanation()]
     )
-    assert lines[0].startswith("[publish] SPC삼립(005610): 대상 2건(하한 미달 제외 0건 · 같은 사건 억제 2건) → 등급 심각 1 · 경고 1 · 주의 0")
+    assert lines[0].startswith(
+        "[publish] SPC삼립(005610): 대상 2건(하한 미달 제외 0건 · 기업 미언급 출처만 0건 · 같은 사건 억제 2건) → 등급 심각 1 · 경고 1 · 주의 0"
+    )
     assert lines[1] == "[publish] 같은 사건 억제(--per-event 1): event 2005 → 남김 3011(71) · 억제 3013(71) · 3012(65)"
     assert [values["match_id"] for values in saved] == [3011, 3014] and len(fake.calls) == 2  # 억제된 건은 LLM 도 부르지 않는다
     stats = result.stats
@@ -229,7 +237,7 @@ def test_publish_suppresses_same_event_and_reports_it(monkeypatch, tmp_path):
         monkeypatch, tmp_path / "existing", targets=same_event_targets()[:3], existing={2005: 1}, per_event=1, responses=[]
     )
     assert saved == [] and len(fake.calls) == 0 and result.stats["suppressed_same_event"] == 3 and result.stats["targets"] == 0
-    assert result.status == "success" and "대상 0건(하한 미달 제외 0건 · 같은 사건 억제 3건)" in lines[0]
+    assert result.status == "success" and "대상 0건(하한 미달 제외 0건 · 기업 미언급 출처만 0건 · 같은 사건 억제 3건)" in lines[0]
 
 
 def test_publish_rejects_per_event_below_one(monkeypatch, tmp_path):
@@ -246,6 +254,82 @@ def test_cli_publish_per_event_argument():
     assert cli.build_parser().parse_args(["publish", "--company", "005610", "--per-event", "2"]).per_event == 2
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["publish", "--per-event", "0"])
+
+
+# --------------------------------------------------------------------------- 근거 품질 게이트 (D-08 · D-17, 실측 match 3219)
+KT_TERMS = ["KT", "케이티"]
+
+
+def test_company_terms_and_has_named_source_case_insensitive():
+    assert svc.company_terms("KT", ["KT", "케이티", "", None]) == ["KT", "케이티"]
+    assert svc.company_terms("SPC삼립", None) == ["SPC삼립"] and svc.company_terms(None, []) == []
+    totals = ["1분기 담합 과징금 6891억원 총계", "설탕 담합 CJ제일제당·삼양사 제재"]
+    assert not svc.has_named_source(totals, KT_TERMS)  # 제목에 KT 가 하나도 없다 — 본문 업종 나열로 스친 사건
+    assert svc.has_named_source([*totals, "KT 과징금 385억원"], KT_TERMS)  # 하나라도 있으면 통과
+    assert svc.has_named_source(["kt 침해사고 일지"], KT_TERMS) and svc.has_named_source(["케이티 조사 착수"], KT_TERMS)
+    assert svc.has_named_source(["otoki 라면 가격"], svc.company_terms("오뚜기", ["오뚜기", "OTOKI"]))
+    assert not svc.has_named_source([], KT_TERMS) and not svc.has_named_source([None, ""], KT_TERMS)  # 출처가 없으면 통과 못 한다
+    assert not svc.has_named_source(["KT&G 담배"], []) # 기업명이 비면 아무것도 매칭하지 않는다
+
+
+def gate_targets() -> list[svc.PublishTarget]:
+    return [
+        target(match_id=3219, event_id=2101, materiality=71, named_source=False, source_count=29, context=context(scores={"materiality": 71, "confidence": 70, "components": {}})),
+        target(match_id=3003, event_id=2003, materiality=88, named_source=True, source_count=2, context=context(scores={"materiality": 88, "confidence": 84, "components": {}})),
+    ]
+
+
+def test_apply_source_gate_excludes_unnamed_unless_allowed():
+    kept, gated = svc.apply_source_gate(gate_targets(), allow_unnamed_source=False)
+    assert [item.match_id for item in kept] == [3003] and [item.match_id for item in gated] == [3219]
+    assert svc.gate_lines(gated) == [
+        "[publish] 기업 미언급 출처만(--allow-unnamed-source 로 해제): event 2101 → match 3219 (출처 29건, 제목에 SPC삼립 없음)"
+    ]
+    kept, gated = svc.apply_source_gate(gate_targets(), allow_unnamed_source=True)
+    assert len(kept) == 2 and gated == [] and svc.gate_lines(gated) == []
+    assert svc.PublishTarget(match_id=1, company_id=1, confirmed=True, materiality=50, context=context()).named_source is True  # 기본값
+
+
+def test_publish_excludes_unnamed_source_event_not_discarded(monkeypatch, tmp_path):
+    result, lines, saved, fake, finished = publish_with(
+        monkeypatch, tmp_path / "gate", targets=gate_targets(), existing={}, per_event=1, responses=[explanation()]
+    )
+    assert lines[0].startswith("[publish] SPC삼립(005610): 대상 1건(하한 미달 제외 0건 · 기업 미언급 출처만 1건 · 같은 사건 억제 0건) → 등급 심각 1")
+    assert lines[1].startswith("[publish] 기업 미언급 출처만(--allow-unnamed-source 로 해제): event 2101 → match 3219 (출처 29건")
+    assert [values["match_id"] for values in saved] == [3003] and len(fake.calls) == 1  # 제외 건은 LLM 도 부르지 않는다
+    stats = result.stats
+    assert stats["targets"] == 1 and stats["no_named_source"] == 1 and stats["allow_unnamed_source"] is False
+    assert stats["discarded"] == 0 and stats["published"] == 1 and result.status == "success"  # 폐기가 아니라 제외
+    assert finished["stats"]["no_named_source"] == 1
+
+    # --allow-unnamed-source → 게이트 해제, 두 건 다 발행
+    result, lines, saved, fake, _ = publish_with(
+        monkeypatch, tmp_path / "allow", targets=gate_targets(), existing={}, per_event=1, responses=[explanation(), explanation()],
+        allow_unnamed_source=True,
+    )
+    assert sorted(values["match_id"] for values in saved) == [3003, 3219] and len(fake.calls) == 2
+    assert result.stats["no_named_source"] == 0 and result.stats["allow_unnamed_source"] is True
+    assert "기업 미언급 출처만 0건" in lines[0] and not any("기업 미언급 출처만(" in line for line in lines)
+
+
+def test_gate_runs_before_same_event_suppression(monkeypatch, tmp_path):
+    # 같은 사건의 상위 매칭이 게이트에 걸리면 그 사건 전체가 걸린다(sources 가 같다) — 억제 자리도 차지하지 않는다
+    targets = [
+        target(match_id=1, event_id=9, materiality=90, named_source=False, source_count=3, context=context(scores={"materiality": 90, "confidence": 1, "components": {}})),
+        target(match_id=2, event_id=9, materiality=80, named_source=False, source_count=3, context=context(scores={"materiality": 80, "confidence": 1, "components": {}})),
+        target(match_id=3, event_id=8, materiality=40, named_source=True, source_count=1, context=context(scores={"materiality": 40, "confidence": 1, "components": {}})),
+    ]
+    result, lines, saved, _, _ = publish_with(monkeypatch, tmp_path, targets=targets, existing={}, per_event=1, responses=[explanation()])
+    assert [values["match_id"] for values in saved] == [3]
+    assert result.stats["no_named_source"] == 2 and result.stats["suppressed_same_event"] == 0
+    assert "기업 미언급 출처만 2건 · 같은 사건 억제 0건" in lines[0]
+
+
+def test_cli_publish_allow_unnamed_source_flag():
+    from esg_watchdog import cli
+
+    assert cli.build_parser().parse_args(["publish"]).allow_unnamed_source is False
+    assert cli.build_parser().parse_args(["publish", "--allow-unnamed-source", "--per-event", "2"]).allow_unnamed_source is True
 
 
 # --------------------------------------------------------------------------- 금지어 → 재생성 → 폐기 (D-17)

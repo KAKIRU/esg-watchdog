@@ -2,10 +2,16 @@
 
 - 대상: matches(status 'accepted', relation ∈ ALERT_RELATIONS, scores not null, alert 없음, scores.materiality ≥ MIN_PUBLISH_MATERIALITY).
   회사(--company)를 주면 그 회사만. 하한 미달은 폐기가 아니라 대상에서 빠질 뿐이고(matches 는 accepted 유지) 건수만 stage_stats.below_threshold 에 남긴다(D-16).
+- 근거 품질 게이트(D-08 · D-17): 사건 sources 기사 중 제목에 그 기업의 이름 또는 별칭(companies.name · aliases, 대소문자 무시)이 든 것이
+  하나도 없으면 발행하지 않는다. F-01 이 별칭을 본문에서도 찾고 D-07 이 (기업·카테고리·유형·연-월)로 묶어, 업종 나열로 스친 총계 기사만으로
+  사건이 서는 구조적 결함(실측 match 3219: 출처 29건 전부 제목에 KT 없음)을 막는다. 제외 건은 폐기가 아니라 대상에서 빠지고(matches 는
+  accepted 유지) stage_stats.no_named_source 에 남긴다. sources 가 비어 있어도 걸린다. --allow-unnamed-source 로 끈다(기본 적용).
+  순서: 하한 → 이 게이트 → 같은 사건 억제(제외 건이 per-event 자리를 차지하지 않게).
 - 같은 사건 억제(D-16): 같은 event_id 에는 경보를 최대 --per-event(기본 DEFAULT_PER_EVENT=1)건만 낸다. 남길 기준은 materiality 내림차순 →
   confidence 내림차순 → match_id 오름차순. DB 에 이미 그 사건으로 발행된 alert(published)도 개수에 넣어 센다(재실행 시 중복 증식 방지).
   억제된 matches 는 status 를 바꾸지 않고 accepted 로 둔다 — 나중에 --per-event 를 올리면 발행된다. 건수는 stage_stats.suppressed_same_event.
-  첫 줄 출력: "대상 N건(하한 미달 제외 M건 · 같은 사건 억제 K건) → 등급 심각 a · 경고 b · 주의 c" — 등급 미리보기는 미확정 '주의' 캡을 적용한 값.
+  첫 줄 출력: "대상 N건(하한 미달 제외 M건 · 기업 미언급 출처만 K건 · 같은 사건 억제 J건) → 등급 심각 a · 경고 b · 주의 c"
+  — 등급 미리보기는 미확정 '주의' 캡을 적용한 값.
 - grade: GRADE_THRESHOLDS(knowledge/weights.py) 로 scores.materiality 를 등급화하고, event.confirmed false 면 '주의' 로 캡(D-08 ②).
 - LLM(llm_model_judge) → AlertExplanation → banned_terms.check_fields(applies_to 4필드). 문제는 세 사유로 나눠 사유별 1회씩, 경보당 합계
   MAX_REGENERATIONS(2)회까지 힌트를 붙여 재생성한다(LLM 최대 3회). 같은 사유가 두 번이면 — 금지어: 폐기 + note(match_id, hits) ·
@@ -17,7 +23,7 @@
 - pipeline_runs(stage='publish', trigger='manual'). 경보 단위 예외 격리. DB·settings import 는 함수 안에서만.
 """
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -113,6 +119,9 @@ class PublishTarget:
     # 같은 사건 억제용 (event 별 상한 · 남길 순서)
     event_id: int = 0
     confidence: int = 0
+    # 근거 품질 게이트: sources 기사 제목 중 기업명·별칭이 든 것이 하나라도 있는가 · sources 수
+    named_source: bool = True
+    source_count: int = 0
 
     @property
     def label(self) -> str:
@@ -127,6 +136,41 @@ class PublishTarget:
     def grade(self) -> str:
         """발행될 등급(미확정 캡 적용). alert_values 와 같은 계산."""
         return cap_grade(grade_for(self.materiality), self.confirmed)
+
+
+def company_terms(name: str | None, aliases: Iterable[str] | None) -> list[str]:
+    """제목 매칭에 쓰는 기업명 + 별칭. 빈 값·중복 제거."""
+    values = [name, *(aliases or [])]
+    return list(dict.fromkeys(str(value).strip() for value in values if value and str(value).strip()))
+
+
+def has_named_source(titles: Iterable[str | None], terms: Sequence[str]) -> bool:
+    """sources 기사 제목 중 하나라도 기업명·별칭을 담고 있으면 True (대소문자 무시). 제목이 없으면 False."""
+    folded = [term.casefold() for term in terms if term]
+    return any(term in str(title).casefold() for title in titles if title for term in folded)
+
+
+def apply_source_gate(
+    targets: Sequence[PublishTarget], allow_unnamed_source: bool
+) -> tuple[list[PublishTarget], list[PublishTarget]]:
+    """(통과, 제외). allow_unnamed_source 면 게이트를 끈다."""
+    if allow_unnamed_source:
+        return list(targets), []
+    kept = [target for target in targets if target.named_source]
+    gated = [target for target in targets if not target.named_source]
+    return kept, gated
+
+
+def gate_lines(gated: Sequence[PublishTarget]) -> list[str]:
+    """제외 내역을 사건별로 한 줄씩."""
+    by_event: dict[int, list[PublishTarget]] = {}
+    for target in gated:
+        by_event.setdefault(target.event_id, []).append(target)
+    return [
+        f"[publish] 기업 미언급 출처만(--allow-unnamed-source 로 해제): event {event_id} → match "
+        f"{' · '.join(str(item.match_id) for item in items)} (출처 {items[0].source_count}건, 제목에 {items[0].context.company_name} 없음)"
+        for event_id, items in by_event.items()
+    ]
 
 
 @dataclass
@@ -180,12 +224,15 @@ def grade_counts(targets: Sequence[PublishTarget]) -> dict[str, int]:
     return counts
 
 
-def targets_line(label: str, targets: Sequence[PublishTarget], below_threshold: int, suppressed: int = 0) -> str:
-    """publish 첫 줄: 대상 N건(하한 미달 제외 M건 · 같은 사건 억제 K건) → 등급 심각 a · 경고 b · 주의 c."""
+def targets_line(
+    label: str, targets: Sequence[PublishTarget], below_threshold: int, suppressed: int = 0, no_named_source: int = 0
+) -> str:
+    """publish 첫 줄: 대상 N건(하한 미달 제외 M건 · 기업 미언급 출처만 K건 · 같은 사건 억제 J건) → 등급 심각 a · 경고 b · 주의 c."""
     counts = grade_counts(targets)
     grades = " · ".join(f"{grade} {counts[grade]}" for grade in reversed(GRADES))
     return (
-        f"[publish] {label}: 대상 {len(targets)}건(하한 미달 제외 {below_threshold}건 · 같은 사건 억제 {suppressed}건) → 등급 {grades} "
+        f"[publish] {label}: 대상 {len(targets)}건(하한 미달 제외 {below_threshold}건 · 기업 미언급 출처만 {no_named_source}건 · "
+        f"같은 사건 억제 {suppressed}건) → 등급 {grades} "
         f"(accepted · {'/'.join(ALERT_RELATIONS)} · materiality ≥ {MIN_PUBLISH_MATERIALITY} · alert 없음 → LLM 호출 {len(targets)}회)"
     )
 
@@ -306,11 +353,22 @@ class PublishResult:
     stats: dict = field(default_factory=dict)
 
 
-def _new_stats(stock_code: str | None, targets: int, below_threshold: int, suppressed: int, per_event: int) -> dict:
+def _new_stats(
+    stock_code: str | None,
+    targets: int,
+    below_threshold: int,
+    no_named_source: int,
+    suppressed: int,
+    *,
+    per_event: int,
+    allow_unnamed_source: bool,
+) -> dict:
     return {
         "company": stock_code or "all",
         "targets": targets,
         "below_threshold": below_threshold,
+        "no_named_source": no_named_source,
+        "allow_unnamed_source": allow_unnamed_source,
         "suppressed_same_event": suppressed,
         "per_event": per_event,
         "attempts": 0,
@@ -389,9 +447,9 @@ def _load_targets(stock_code: str | None) -> TargetSet:
                 continue
             source = commitment.source or {}
             document = session.get(Document, source.get("doc_id")) if source.get("doc_id") else None
-            presses = presses_of(
-                session.scalars(select(Article.press).where(Article.id.in_(list(event.sources or [])))).all()
-            )
+            sources = list(event.sources or [])
+            articles = session.execute(select(Article.press, Article.title).where(Article.id.in_(sources))).all() if sources else []
+            presses = presses_of([press for press, _ in articles])
             targets.append(
                 PublishTarget(
                     match_id=match.id,
@@ -400,6 +458,8 @@ def _load_targets(stock_code: str | None) -> TargetSet:
                     materiality=materiality,
                     event_id=int(event.id),
                     confidence=int(scores.get("confidence") or 0),
+                    named_source=has_named_source([title for _, title in articles], company_terms(company.name, company.aliases)),
+                    source_count=len(sources),
                     context=AlertContext(
                         company_name=company.name,
                         commitment=AlertCommitment(
@@ -451,9 +511,11 @@ def publish_alerts(
     model: str | None = None,
     now: datetime | None = None,
     per_event: int = DEFAULT_PER_EVENT,
+    allow_unnamed_source: bool = False,
     log: Log = print,
 ) -> PublishResult:
-    """경보 발행 한 번 실행. 같은 사건은 per_event 건까지만. 경보 단위로 예외를 격리하고 pipeline_runs 에 기록한다."""
+    """경보 발행 한 번 실행. 기업 미언급 출처만 있는 사건은 제외(allow_unnamed_source 로 해제), 같은 사건은 per_event 건까지만.
+    경보 단위로 예외를 격리하고 pipeline_runs 에 기록한다."""
     from sqlalchemy.exc import SQLAlchemyError
 
     if client is None:
@@ -468,13 +530,22 @@ def publish_alerts(
     if per_event < 1:
         raise ValueError(f"--per-event 는 1 이상이어야 한다: {per_event}")
     loaded = _load_targets(stock_code)
-    targets, suppressed = suppress_same_event(loaded.targets, loaded.existing_alerts, per_event)
-    log(targets_line(loaded.label, targets, loaded.below_threshold, len(suppressed)))
-    for line in suppression_lines(targets, suppressed, per_event):
+    passed, gated = apply_source_gate(loaded.targets, allow_unnamed_source)
+    targets, suppressed = suppress_same_event(passed, loaded.existing_alerts, per_event)
+    log(targets_line(loaded.label, targets, loaded.below_threshold, len(suppressed), len(gated)))
+    for line in (*gate_lines(gated), *suppression_lines(targets, suppressed, per_event)):
         log(line)
 
     run_id = start_run(STAGE)
-    stats = _new_stats(stock_code, len(targets), loaded.below_threshold, len(suppressed), per_event)
+    stats = _new_stats(
+        stock_code,
+        len(targets),
+        loaded.below_threshold,
+        len(gated),
+        len(suppressed),
+        per_event=per_event,
+        allow_unnamed_source=allow_unnamed_source,
+    )
     notes: list[str] = []
     failed: list[str] = []
     calls_before, hits_before = client.stats["calls"], client.stats["cache_hits"]
