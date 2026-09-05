@@ -18,7 +18,10 @@ def test_industry_weight_keys_match_event_types_exactly():
     assert set(weights.RELATION_COEF) == set(RELATIONS)
     assert weights.RELATION_COEF["이행긍정"] == 0.0 and weights.RELATION_COEF["무관"] == 0.0
     assert [grade for grade, _ in weights.GRADE_THRESHOLDS] == list(reversed(GRADES))
-    assert weights.GRADE_THRESHOLDS[-1][1] == 0  # 마지막 등급이 나머지를 받는다
+    # D-16 실측 조정: 60/45/30. 마지막 등급('주의')의 임계값이 곧 발행 하한 — 그 아래는 등급을 매길 일이 없다
+    assert [threshold for _, threshold in weights.GRADE_THRESHOLDS] == [60, 45, 30]
+    assert weights.GRADE_THRESHOLDS[-1][1] == weights.MIN_PUBLISH_MATERIALITY == 30
+    assert "실측" in weights.__doc__ and "D-16" in weights.__doc__
     assert weights.__doc__.startswith("기본값. D-13·D-14·D-16 은 B 가 검토 후 조정한다")
 
 

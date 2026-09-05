@@ -1,8 +1,10 @@
-"""services/publish/alerts.py — 가짜 LLM 으로 금지어 → 재생성 → 폐기, 길이 재생성 → 채택+note, confirmed false → '주의' 캡, 미확정 limitation 강제를 DB 없이 검사한다 (D-08 · D-16 · D-17)."""
+"""services/publish/alerts.py — 가짜 LLM 으로 금지어 → 재생성 → 폐기, 길이 재생성 → 채택+note, confirmed false → '주의' 캡, 미확정 limitation 강제,
+등급 임계값 60/45/30 · 발행 하한 30(미달은 대상 제외 + stage_stats.below_threshold) 을 DB 없이 검사한다 (D-08 · D-16 · D-17)."""
 
 from datetime import date, datetime
 
 from esg_watchdog.knowledge.banned_terms import load_banned_terms
+from esg_watchdog.knowledge.weights import GRADE_THRESHOLDS, MIN_PUBLISH_MATERIALITY
 from esg_watchdog.llm.client import LLMClient
 from esg_watchdog.llm.providers.fake_provider import FakeProvider
 from esg_watchdog.prompts.alert_explain import (
@@ -65,14 +67,26 @@ def make_client(tmp_path, responses):
 
 
 # --------------------------------------------------------------------------- 등급 (D-16 · D-08 ②)
-def test_grade_thresholds_and_unconfirmed_cap():
-    assert svc.grade_for(80) == "심각" and svc.grade_for(100) == "심각"
-    assert svc.grade_for(79) == "경고" and svc.grade_for(70) == "경고"
-    assert svc.grade_for(69) == "주의" and svc.grade_for(0) == "주의" and svc.grade_for(None) == "주의"
+def test_grade_thresholds_at_boundaries_29_30_45_60():
+    assert GRADE_THRESHOLDS == [("심각", 60), ("경고", 45), ("주의", 30)] and MIN_PUBLISH_MATERIALITY == 30
+    assert svc.grade_for(60) == "심각" and svc.grade_for(100) == "심각" and svc.grade_for(61) == "심각"
+    assert svc.grade_for(59) == "경고" and svc.grade_for(45) == "경고"
+    assert svc.grade_for(44) == "주의" and svc.grade_for(30) == "주의"
+    # 하한 미달은 grade_for 만 보면 마지막 등급이지만 발행 대상이 아니다(is_publishable 로 걸러진다)
+    assert svc.grade_for(29) == "주의" and svc.grade_for(0) == "주의" and svc.grade_for(None) == "주의"
+    assert svc.is_publishable(30) and svc.is_publishable(30.0) and svc.is_publishable(100)
+    assert not svc.is_publishable(29) and not svc.is_publishable(29.9) and not svc.is_publishable(0) and not svc.is_publishable(None)
+
+
+def test_unconfirmed_cap_still_applies_with_new_thresholds():
     assert svc.cap_grade("심각", confirmed=True) == "심각"
     assert svc.cap_grade("심각", confirmed=False) == "주의"
     assert svc.cap_grade("경고", confirmed=False) == "주의"
     assert svc.cap_grade("주의", confirmed=False) == "주의"
+    # PublishTarget.grade 는 alert_values 와 같은 계산(임계값 + 캡)
+    assert target(materiality=60, confirmed=True).grade == "심각" and target(materiality=60, confirmed=False).grade == "주의"
+    assert target(materiality=45, confirmed=True).grade == "경고" and target(materiality=45, confirmed=False).grade == "주의"
+    assert target(materiality=30, confirmed=True).grade == "주의" and target(materiality=30, confirmed=False).grade == "주의"
 
 
 def test_unconfirmed_event_is_capped_to_caution_and_limitation_gets_sentence(tmp_path):
@@ -97,7 +111,43 @@ def test_confirmed_event_keeps_grade(tmp_path):
     outcome = svc.explain_target(client, "m", target(materiality=88), log=lambda _line: None)
     values = svc.alert_values(target(materiality=88), outcome.explanation, datetime(2026, 9, 4, tzinfo=KST))
     assert values["grade"] == "심각" and values["fallback"] is None
-    assert svc.alert_values(target(materiality=71), outcome.explanation, datetime(2026, 9, 4, tzinfo=KST))["grade"] == "경고"
+    assert svc.alert_values(target(materiality=71), outcome.explanation, datetime(2026, 9, 4, tzinfo=KST))["grade"] == "심각"  # 옛 임계값이면 '경고'
+    assert svc.alert_values(target(materiality=50), outcome.explanation, datetime(2026, 9, 4, tzinfo=KST))["grade"] == "경고"
+    assert svc.alert_values(target(materiality=35), outcome.explanation, datetime(2026, 9, 4, tzinfo=KST))["grade"] == "주의"
+
+
+# --------------------------------------------------------------------------- 발행 하한 · 첫 줄 출력 (D-16)
+def test_below_threshold_targets_are_excluded_not_discarded_and_first_line_shows_grade_summary(monkeypatch, tmp_path):
+    lines: list[str] = []
+    saved: list[dict] = []
+    finished: dict = {}
+    # _load_targets 가 하한(≥30)을 이미 걸러 (대상, 제외 수) 를 돌려준 상태를 흉내낸다 — 제외 19건은 대조군 오뚜기의 약한 '후퇴'
+    targets = [
+        target(match_id=1, materiality=60, confirmed=True, context=context(scores={"materiality": 60, "confidence": 65, "components": {}})),
+        target(match_id=2, materiality=45, confirmed=False, context=context(scores={"materiality": 45, "confidence": 65, "components": {}})),
+        target(match_id=3, materiality=30, confirmed=True, context=context(scores={"materiality": 30, "confidence": 65, "components": {}})),
+    ]
+    monkeypatch.setattr(svc, "_load_targets", lambda stock_code: ("전체", targets, 19))
+    monkeypatch.setattr(svc, "start_run", lambda stage: 77)
+    monkeypatch.setattr(svc, "finish_run", lambda run_id, status, stats, note=None: finished.update(run_id=run_id, status=status, stats=stats, note=note))
+    monkeypatch.setattr(svc, "_insert_alert", lambda values: saved.append(values) or True)
+    client, fake = make_client(tmp_path, [explanation(), explanation(), explanation()])
+
+    result = svc.publish_alerts(client=client, model="m", now=datetime(2026, 9, 5, 9, 0, tzinfo=KST), log=lines.append)
+
+    assert lines[0] == (
+        "[publish] 전체: 대상 3건(하한 미달 제외 19건) → 등급 심각 1 · 경고 0 · 주의 2 "
+        "(accepted · 위반/후퇴/이행지연 · materiality ≥ 30 · alert 없음 → LLM 호출 3회)"
+    )
+    assert len(fake.calls) == 3 and [values["grade"] for values in saved] == ["심각", "주의", "주의"]  # 45점 미확정 → 캡
+    stats = result.stats
+    assert stats["targets"] == 3 and stats["below_threshold"] == 19  # 미달은 폐기(discarded)가 아니라 제외
+    assert stats["published"] == 3 and stats["discarded"] == 0 and stats["capped"] == 1 and stats["llm_calls"] == 3
+    assert stats["grades"] == {"주의": 2, "경고": 0, "심각": 1}
+    assert result.status == "success" and finished["run_id"] == 77 and finished["stats"]["below_threshold"] == 19
+    # 미리보기 헬퍼 — 대상이 없으면 전부 0
+    assert svc.grade_counts([]) == {"주의": 0, "경고": 0, "심각": 0}
+    assert svc.targets_line("KT(030200)", [], 5).startswith("[publish] KT(030200): 대상 0건(하한 미달 제외 5건) → 등급 심각 0 · 경고 0 · 주의 0")
 
 
 # --------------------------------------------------------------------------- 금지어 → 재생성 → 폐기 (D-17)

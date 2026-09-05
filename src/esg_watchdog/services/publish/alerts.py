@@ -1,6 +1,8 @@
 """F-06 경보 발행 — matches → alerts (D-08 · D-16 · D-17).
 
-- 대상: matches(status 'accepted', relation ∈ ALERT_RELATIONS, scores not null, alert 없음). 회사(--company)를 주면 그 회사만.
+- 대상: matches(status 'accepted', relation ∈ ALERT_RELATIONS, scores not null, alert 없음, scores.materiality ≥ MIN_PUBLISH_MATERIALITY).
+  회사(--company)를 주면 그 회사만. 하한 미달은 폐기가 아니라 대상에서 빠질 뿐이고(matches 는 accepted 유지) 건수만 stage_stats.below_threshold 에 남긴다(D-16).
+  첫 줄 출력: "대상 N건(하한 미달 제외 M건) → 등급 심각 a · 경고 b · 주의 c" — 등급 미리보기는 미확정 '주의' 캡을 적용한 값.
 - grade: GRADE_THRESHOLDS(knowledge/weights.py) 로 scores.materiality 를 등급화하고, event.confirmed false 면 '주의' 로 캡(D-08 ②).
 - LLM(llm_model_judge) → AlertExplanation → banned_terms.check_fields(applies_to 4필드) → 걸리면 regeneration_hint 를 붙여 1회 재생성 →
   또 걸리면 폐기 + pipeline_runs.note 에 (match_id, hits). explanation 길이가 400~800자를 벗어나면 1회 재생성, 그래도 벗어나면 채택 + note.
@@ -10,13 +12,13 @@
 - pipeline_runs(stage='publish', trigger='manual'). 경보 단위 예외 격리. DB·settings import 는 함수 안에서만.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from esg_watchdog.knowledge.banned_terms import check_fields, regeneration_hint
 from esg_watchdog.knowledge.taxonomy import ALERT_RELATIONS, GRADES
-from esg_watchdog.knowledge.weights import GRADE_THRESHOLDS
+from esg_watchdog.knowledge.weights import GRADE_THRESHOLDS, MIN_PUBLISH_MATERIALITY
 from esg_watchdog.llm.client import LLMClient
 from esg_watchdog.prompts.alert_explain import (
     MAX_LENGTH,
@@ -50,7 +52,7 @@ Log = Callable[[str], None]
 
 # --------------------------------------------------------------------------- 순수 함수
 def grade_for(materiality: float | None) -> str:
-    """GRADE_THRESHOLDS 위에서부터 materiality ≥ threshold 인 첫 등급."""
+    """GRADE_THRESHOLDS 위에서부터 materiality ≥ threshold 인 첫 등급. 하한 미달(발행 대상 아님)은 마지막 등급을 돌려준다."""
     value = float(materiality or 0)
     for grade, threshold in GRADE_THRESHOLDS:
         if value >= threshold:
@@ -63,6 +65,11 @@ def cap_grade(grade: str, confirmed: bool) -> str:
     if confirmed:
         return grade
     return min(grade, CAP_GRADE, key=GRADES.index)
+
+
+def is_publishable(materiality: float | None) -> bool:
+    """D-16 발행 하한 — materiality ≥ MIN_PUBLISH_MATERIALITY 만 경보 대상. 미달은 폐기가 아니라 미발행(matches 는 그대로)."""
+    return float(materiality or 0) >= MIN_PUBLISH_MATERIALITY
 
 
 def explanation_length(text: str) -> int:
@@ -94,6 +101,29 @@ class PublishTarget:
     @property
     def label(self) -> str:
         return f"match {self.match_id}"
+
+    @property
+    def grade(self) -> str:
+        """발행될 등급(미확정 캡 적용). alert_values 와 같은 계산."""
+        return cap_grade(grade_for(self.materiality), self.confirmed)
+
+
+def grade_counts(targets: Sequence[PublishTarget]) -> dict[str, int]:
+    """대상의 등급 분포 미리보기 — 키는 GRADES 순서(주의 · 경고 · 심각)."""
+    counts = dict.fromkeys(GRADES, 0)
+    for target in targets:
+        counts[target.grade] += 1
+    return counts
+
+
+def targets_line(label: str, targets: Sequence[PublishTarget], below_threshold: int) -> str:
+    """publish 첫 줄: 대상 N건(하한 미달 제외 M건) → 등급 심각 a · 경고 b · 주의 c."""
+    counts = grade_counts(targets)
+    grades = " · ".join(f"{grade} {counts[grade]}" for grade in reversed(GRADES))
+    return (
+        f"[publish] {label}: 대상 {len(targets)}건(하한 미달 제외 {below_threshold}건) → 등급 {grades} "
+        f"(accepted · {'/'.join(ALERT_RELATIONS)} · materiality ≥ {MIN_PUBLISH_MATERIALITY} · alert 없음 → LLM 호출 {len(targets)}회)"
+    )
 
 
 @dataclass
@@ -168,11 +198,10 @@ def explain_target(client: LLMClient, model: str, target: PublishTarget, *, log:
 
 
 def alert_values(target: PublishTarget, explanation: AlertExplanation, published_at: datetime) -> dict:
-    grade = cap_grade(grade_for(target.materiality), target.confirmed)
     return {
         "match_id": target.match_id,
         "company_id": target.company_id,
-        "grade": grade,
+        "grade": target.grade,
         "headline": explanation.headline.strip(),
         "explanation": explanation.explanation.strip(),
         "limitation": explanation.limitation.strip(),
@@ -191,10 +220,11 @@ class PublishResult:
     stats: dict = field(default_factory=dict)
 
 
-def _new_stats(stock_code: str | None, targets: int) -> dict:
+def _new_stats(stock_code: str | None, targets: int, below_threshold: int) -> dict:
     return {
         "company": stock_code or "all",
         "targets": targets,
+        "below_threshold": below_threshold,
         "attempts": 0,
         "regenerated": 0,
         "published": 0,
@@ -209,7 +239,8 @@ def _new_stats(stock_code: str | None, targets: int) -> dict:
     }
 
 
-def _load_targets(stock_code: str | None) -> tuple[str, list[PublishTarget]]:
+def _load_targets(stock_code: str | None) -> tuple[str, list[PublishTarget], int]:
+    """(라벨, 대상, 하한 미달로 제외한 수). 하한은 컨텍스트(문서·언론사 조회)를 만들기 전에 건다."""
     from sqlalchemy import exists, select
 
     from esg_watchdog.db import SessionLocal
@@ -234,6 +265,7 @@ def _load_targets(stock_code: str | None) -> tuple[str, list[PublishTarget]]:
     )
     label = "전체"
     targets: list[PublishTarget] = []
+    below_threshold = 0
     with SessionLocal() as session:
         if stock_code:
             company = session.scalar(select(Company).where(Company.stock_code == stock_code))
@@ -242,18 +274,22 @@ def _load_targets(stock_code: str | None) -> tuple[str, list[PublishTarget]]:
             label = f"{company.name}({company.stock_code})"
             stmt = stmt.where(Company.id == company.id)
         for match, commitment, event, company in session.execute(stmt).all():
+            scores = dict(match.scores or {})
+            materiality = int(scores.get("materiality") or 0)
+            if not is_publishable(materiality):
+                below_threshold += 1
+                continue
             source = commitment.source or {}
             document = session.get(Document, source.get("doc_id")) if source.get("doc_id") else None
             presses = presses_of(
                 session.scalars(select(Article.press).where(Article.id.in_(list(event.sources or [])))).all()
             )
-            scores = dict(match.scores or {})
             targets.append(
                 PublishTarget(
                     match_id=match.id,
                     company_id=company.id,
                     confirmed=bool(event.confirmed),
-                    materiality=int(scores.get("materiality") or 0),
+                    materiality=materiality,
                     context=AlertContext(
                         company_name=company.name,
                         commitment=AlertCommitment(
@@ -281,17 +317,20 @@ def _load_targets(stock_code: str | None) -> tuple[str, list[PublishTarget]]:
                     ),
                 )
             )
-    return label, targets
+    return label, targets, below_threshold
 
 
-def _insert_alert(session, values: dict) -> bool:
+def _insert_alert(values: dict) -> bool:
     """match_id UNIQUE — 이미 있으면 건너뛴다(idempotent). 넣었으면 True."""
     from sqlalchemy.dialects.postgresql import insert
 
+    from esg_watchdog.db import SessionLocal
     from esg_watchdog.models import Alert
 
-    result = session.execute(insert(Alert).values(**values).on_conflict_do_nothing(index_elements=["match_id"]))
-    return bool(result.rowcount)
+    with SessionLocal() as session:
+        result = session.execute(insert(Alert).values(**values).on_conflict_do_nothing(index_elements=["match_id"]))
+        session.commit()
+        return bool(result.rowcount)
 
 
 def publish_alerts(
@@ -305,8 +344,6 @@ def publish_alerts(
     """경보 발행 한 번 실행. 경보 단위로 예외를 격리하고 pipeline_runs 에 기록한다."""
     from sqlalchemy.exc import SQLAlchemyError
 
-    from esg_watchdog.db import SessionLocal
-
     if client is None:
         client = LLMClient()
     if model is None:
@@ -316,11 +353,11 @@ def publish_alerts(
     # 키·공급자 설정 오류는 pipeline_runs 를 만들기 전에 낸다
     provider_name = client.provider.name
 
-    label, targets = _load_targets(stock_code)
-    log(f"[publish] {label}: 대상 {len(targets)}건 (accepted · {'/'.join(ALERT_RELATIONS)} · scores 있음 · alert 없음) → LLM 호출 {len(targets)}회")
+    label, targets, below_threshold = _load_targets(stock_code)
+    log(targets_line(label, targets, below_threshold))
 
     run_id = start_run(STAGE)
-    stats = _new_stats(stock_code, len(targets))
+    stats = _new_stats(stock_code, len(targets), below_threshold)
     notes: list[str] = []
     failed: list[str] = []
     calls_before, hits_before = client.stats["calls"], client.stats["cache_hits"]
@@ -339,10 +376,7 @@ def publish_alerts(
                 log(f"  {target.label}: 폐기 — {outcome.discarded}")
                 continue
             values = alert_values(target, outcome.explanation, now or now_kst())
-            with SessionLocal() as session:
-                inserted = _insert_alert(session, values)
-                session.commit()
-            if not inserted:
+            if not _insert_alert(values):
                 stats["skipped_existing"] += 1
                 log(f"  {target.label}: 이미 alert 가 있어 건너뜀")
                 continue
