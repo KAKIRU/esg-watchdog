@@ -1,5 +1,6 @@
 """services/publish/alerts.py — 가짜 LLM 으로 금지어 → 재생성 → 폐기, 길이 재생성 → 채택+note, confirmed false → '주의' 캡, 미확정 limitation 강제,
-등급 임계값 60/45/30 · 발행 하한 30(미달은 대상 제외 + stage_stats.below_threshold) 을 DB 없이 검사한다 (D-08 · D-16 · D-17)."""
+등급 임계값 60/45/30 · 발행 하한 30(미달은 대상 제외 + stage_stats.below_threshold), 사유별 재생성 예산(금지어 → 스키마 실패 → 성공이 살아남고
+같은 사유 두 번이면 폐기, stage_stats 사유별 분리) 을 DB 없이 검사한다 (D-08 · D-16 · D-17)."""
 
 from datetime import date, datetime
 
@@ -217,7 +218,81 @@ def test_schema_failure_regenerates_once_then_discards(tmp_path):
     assert outcome.explanation is not None
     broken, _ = make_client(tmp_path / "b", [{"headline": 1}, {"explanation": None}])
     outcome = svc.explain_target(broken, "m", target(), log=lambda _line: None)
-    assert outcome.explanation is None and "(스키마 실패)" in outcome.discarded
+    assert outcome.explanation is None and "(스키마 실패) 재발" in outcome.discarded
+    assert outcome.regenerations == {"banned": 0, "schema": 1, "length": 0}
+
+
+# --------------------------------------------------------------------------- 사유별 재생성 예산 (D-17, 실측 run=42 match 3084)
+def without_headline(**overrides) -> dict:
+    """실측에서 재생성 응답이 headline 을 빠뜨린 경우 — 스키마 실패."""
+    response = explanation(**overrides)
+    del response["headline"]
+    return response
+
+
+def test_banned_then_schema_failure_then_success_survives(tmp_path):
+    banned = explanation(fallback="반드시 공약 위반이라고 볼 수는 없습니다.")
+    client, fake = make_client(tmp_path, [banned, without_headline(), explanation()])
+    outcome = svc.explain_target(client, "m", target(), log=lambda _line: None)
+    assert len(fake.calls) == 3 and outcome.attempts == 3
+    assert outcome.explanation is not None and outcome.discarded is None
+    assert outcome.regenerations == {"banned": 1, "schema": 1, "length": 0} and outcome.regenerated
+    banned_hint = load_banned_terms()["policy"]["regeneration_hint"].format(hit_terms="반드시")
+    assert banned_hint in fake.calls[1]["user"] and "형식에 맞지 않았습니다" not in fake.calls[1]["user"]
+    # 3회차: 스키마 오류 + 금지어 힌트 유지(같은 표현이 되살아나지 않게)
+    assert banned_hint in fake.calls[2]["user"] and "형식에 맞지 않았습니다" in fake.calls[2]["user"]
+
+
+def test_banned_twice_is_discarded_even_with_schema_failure_between(tmp_path):
+    banned = explanation(fallback="반드시 공약 위반이라고 볼 수는 없습니다.")
+    client, fake = make_client(tmp_path, [banned, without_headline(), explanation(limitation="투자의견 매수입니다.")])
+    outcome = svc.explain_target(client, "m", target(), log=lambda _line: None)
+    assert len(fake.calls) == 3 and outcome.explanation is None
+    assert outcome.discarded.startswith("match 3005: 금지어 재발") and outcome.hits == {"limitation": ["매수", "투자의견"]}
+    assert outcome.regenerations == {"banned": 1, "schema": 1, "length": 0}
+
+
+def test_total_regeneration_cap_is_two(tmp_path):
+    assert svc.MAX_REGENERATIONS == 2
+    short = explanation(explanation="짧다.\n\n둘.\n\n셋.\n\n넷.")
+    # 스키마 → 길이 → 금지어: 세 사유가 다 다르지만 합계 2회를 넘기므로 세 번째 문제(금지어)는 폐기
+    client, fake = make_client(tmp_path / "cap-banned", [{"headline": 1}, short, explanation(headline="지금 매수")])
+    outcome = svc.explain_target(client, "m", target(), log=lambda _line: None)
+    assert len(fake.calls) == 3 and outcome.explanation is None
+    assert "재생성 한도 2회 소진" in outcome.discarded and outcome.regenerations == {"banned": 0, "schema": 1, "length": 1}
+    # 스키마 → 금지어 → 길이: 길이는 폐기 사유가 아니라 채택 + note
+    client, fake = make_client(tmp_path / "cap-length", [{"headline": 1}, explanation(headline="지금 매수"), short])
+    outcome = svc.explain_target(client, "m", target(), log=lambda _line: None)
+    assert len(fake.calls) == 3 and outcome.explanation is not None
+    assert any("범위 밖이지만 채택" in note for note in outcome.notes)
+    assert outcome.regenerations == {"banned": 1, "schema": 1, "length": 0}
+    # 스키마 두 번은 폐기 (같은 사유 재발)
+    client, fake = make_client(tmp_path / "schema-twice", [{"headline": 1}, without_headline(), explanation()])
+    outcome = svc.explain_target(client, "m", target(), log=lambda _line: None)
+    assert len(fake.calls) == 2 and outcome.explanation is None and "(스키마 실패) 재발" in outcome.discarded
+
+
+def test_stage_stats_split_regenerations_by_reason(monkeypatch, tmp_path):
+    finished: dict = {}
+    targets = [
+        target(match_id=1, materiality=60, context=context(scores={"materiality": 60, "confidence": 65, "components": {}})),
+        target(match_id=2, materiality=45, context=context(scores={"materiality": 45, "confidence": 65, "components": {}})),
+    ]
+    monkeypatch.setattr(svc, "_load_targets", lambda stock_code: ("전체", targets, 0))
+    monkeypatch.setattr(svc, "start_run", lambda stage: 78)
+    monkeypatch.setattr(svc, "finish_run", lambda run_id, status, stats, note=None: finished.update(stats=stats, note=note))
+    monkeypatch.setattr(svc, "_insert_alert", lambda values: True)
+    # match 1: 금지어 → 스키마 실패 → 성공 (3회) · match 2: 한 번에 성공 (1회)
+    client, fake = make_client(
+        tmp_path, [explanation(fallback="반드시 그렇다고 볼 수는 없습니다."), without_headline(), explanation(), explanation()]
+    )
+    result = svc.publish_alerts(client=client, model="m", now=datetime(2026, 9, 5, 9, 0, tzinfo=KST), log=lambda _line: None)
+    stats = result.stats
+    assert len(fake.calls) == 4 and stats["attempts"] == 4 and stats["llm_calls"] == 4
+    assert stats["published"] == 2 and stats["discarded"] == 0
+    assert stats["regenerated"] == 1  # 재생성이 있었던 경보 수
+    assert (stats["regenerated_banned"], stats["regenerated_schema"], stats["regenerated_length"]) == (1, 1, 0)
+    assert finished["stats"]["regenerated_schema"] == 1 and result.status == "success"
 
 
 # --------------------------------------------------------------------------- 프롬프트
@@ -228,11 +303,16 @@ def test_prompt_contains_inputs_and_rules():
     assert "소급 건: 예" in prompt and "관계: 위반" in prompt and "공시 이후 6개월" in prompt
     month = build_user_prompt(context(event=AlertEvent(title="t", summary="s", evidence_quote="q", event_date=date(2026, 6, 1), date_precision="month", confirmed=False, confirmed_basis=None)))
     assert "2026년 06월" in month and "미확정(조사·의혹 단계)" in month
-    assert PROMPT_VERSION == "f06-v1"
+    assert PROMPT_VERSION == "f06-v2"  # 캐시 키에 들어간다 — 프롬프트를 고치면 올린다
     from esg_watchdog.prompts.alert_explain import SYSTEM_PROMPT
 
     for category in ("매매권유", "가격전망", "밸류에이션", "투자자문", "확정단정", "사법단정"):
         assert category in SYSTEM_PROMPT
     assert "4단락" in SYSTEM_PROMPT and "400~800자" in SYSTEM_PROMPT and "기업명은 카드가 따로 표시" in SYSTEM_PROMPT
+    # f06-v2: 네 필드 항상 포함 · fallback 단정어 부정 구문 금지. 지시문 자체에는 '반드시' 를 출력 금지 예시 안에서만 쓴다
+    assert "네 필드를 항상 모두 포함한다" in SYSTEM_PROMPT and "다른 필드를 생략하지 마라" in SYSTEM_PROMPT
+    assert "단정어 부정 구문을 쓰지 마라" in SYSTEM_PROMPT and "…로 읽힐 여지도 있습니다" in SYSTEM_PROMPT
+    assert '"반드시 …라고 볼 수는 없습니다" 같은' in SYSTEM_PROMPT
+    assert "반드시 넣는다" not in SYSTEM_PROMPT and "반드시 지킨다" not in SYSTEM_PROMPT  # 지시문의 '반드시' 는 뺐다(금지 예시 목록에만 남는다)
     schema = AlertExplanation.model_json_schema()
     assert schema["required"] == ["headline", "explanation", "limitation", "fallback"]

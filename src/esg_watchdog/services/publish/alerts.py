@@ -4,9 +4,11 @@
   회사(--company)를 주면 그 회사만. 하한 미달은 폐기가 아니라 대상에서 빠질 뿐이고(matches 는 accepted 유지) 건수만 stage_stats.below_threshold 에 남긴다(D-16).
   첫 줄 출력: "대상 N건(하한 미달 제외 M건) → 등급 심각 a · 경고 b · 주의 c" — 등급 미리보기는 미확정 '주의' 캡을 적용한 값.
 - grade: GRADE_THRESHOLDS(knowledge/weights.py) 로 scores.materiality 를 등급화하고, event.confirmed false 면 '주의' 로 캡(D-08 ②).
-- LLM(llm_model_judge) → AlertExplanation → banned_terms.check_fields(applies_to 4필드) → 걸리면 regeneration_hint 를 붙여 1회 재생성 →
-  또 걸리면 폐기 + pipeline_runs.note 에 (match_id, hits). explanation 길이가 400~800자를 벗어나면 1회 재생성, 그래도 벗어나면 채택 + note.
-  두 문제가 같이 나면 힌트를 함께 붙여 한 번만 재생성한다(경보당 LLM 최대 2회). 스키마 실패(ValueError)도 같은 재생성 1회.
+- LLM(llm_model_judge) → AlertExplanation → banned_terms.check_fields(applies_to 4필드). 문제는 세 사유로 나눠 사유별 1회씩, 경보당 합계
+  MAX_REGENERATIONS(2)회까지 힌트를 붙여 재생성한다(LLM 최대 3회). 같은 사유가 두 번이면 — 금지어: 폐기 + note(match_id, hits) ·
+  스키마 실패(ValueError): 폐기 · 길이(400~800자 밖): 채택 + note. 금지어와 길이가 같이 나면 힌트를 함께 붙여 한 번에 재생성하고,
+  금지어 힌트는 이후 재생성에도 유지한다. 실측(run=42)에서 금지어 재생성 응답이 필드 누락(스키마)으로 죽어 살릴 수 없었던 경로를 살린다(D-17).
+  사유별 횟수는 stage_stats.regenerated_banned · regenerated_schema · regenerated_length 에 남긴다.
 - confirmed false 인데 limitation 에 "확정되지 않" 이 없으면 UNCONFIRMED_SENTENCE 를 붙인다(D-08 ④).
 - Alert(published_at=now KST, status 'published', prompt_version) insert — match_id UNIQUE 로 idempotent(있으면 건너뜀).
 - pipeline_runs(stage='publish', trigger='manual'). 경보 단위 예외 격리. DB·settings import 는 함수 안에서만.
@@ -46,6 +48,12 @@ ALERT_STATUS = "published"
 CAP_GRADE = "주의"  # D-08 ②: 미확정 사건의 상한
 UNCONFIRMED_MARK = "확정되지 않"
 UNCONFIRMED_SENTENCE = "이 사건은 조사·의혹 단계로 확정되지 않았습니다."
+# 재생성 사유 — 사유마다 1회씩, 경보당 합계 MAX_REGENERATIONS 회까지 (D-17)
+REASON_BANNED = "banned"
+REASON_SCHEMA = "schema"
+REASON_LENGTH = "length"
+REASONS = (REASON_BANNED, REASON_SCHEMA, REASON_LENGTH)
+MAX_REGENERATIONS = 2
 
 Log = Callable[[str], None]
 
@@ -133,7 +141,12 @@ class ExplainOutcome:
     hits: dict[str, list[str]] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     attempts: int = 0
-    regenerated: bool = False
+    # 사유별 재생성 횟수 {banned, schema, length}
+    regenerations: dict[str, int] = field(default_factory=lambda: dict.fromkeys(REASONS, 0))
+
+    @property
+    def regenerated(self) -> bool:
+        return any(self.regenerations.values())
 
 
 def _explain(client: LLMClient, model: str, context: AlertContext, **hints) -> AlertExplanation:
@@ -147,47 +160,64 @@ def _problems(explanation: AlertExplanation) -> tuple[dict[str, list[str]], int 
 
 
 def explain_target(client: LLMClient, model: str, target: PublishTarget, *, log: Log = print) -> ExplainOutcome:
-    """경보 하나의 설명문. 금지어·길이·스키마 문제는 힌트를 붙여 1회 재생성 → 금지어 재발은 폐기, 길이 재발은 채택 + note."""
+    """경보 하나의 설명문. 문제(금지어 · 스키마 · 길이)마다 힌트를 붙여 사유별 1회씩, 합계 MAX_REGENERATIONS 회까지 재생성한다.
+
+    같은 사유가 두 번(또는 합계 한도 소진)이면 — 금지어·스키마: 폐기, 길이: 채택 + note. 금지어 힌트는 한 번 붙으면 이후 재생성에도 남겨
+    같은 표현이 되살아나지 않게 하고, 스키마 오류는 직전 실패에만 붙인다.
+    """
     outcome = ExplainOutcome()
-    explanation: AlertExplanation | None = None
-    hits: dict[str, list[str]] = {}
-    length: int | None = None
+    used: set[str] = set()
+    banned_hint: str | None = None
+    hint_for_length: str | None = None
     schema_error: str | None = None
+    explanation: AlertExplanation | None = None
 
-    outcome.attempts += 1
-    try:
-        explanation = _explain(client, model, target.context)
-        hits, length = _problems(explanation)
-    except ValueError as exc:
-        schema_error = str(exc)
-
-    if hits or length is not None or schema_error:
-        outcome.regenerated = True
+    while True:
         outcome.attempts += 1
-        reason = (
-            f"스키마 실패: {schema_error[:120]}"
-            if schema_error
-            else " · ".join(part for part in (f"금지어 {hits}" if hits else "", f"길이 {length}자" if length is not None else "") if part)
-        )
-        log(f"  {target.label}: 재생성 — {reason}")
-        hint_terms = [term for terms in hits.values() for term in terms]
-        hints = {
-            "banned_hint": regeneration_hint(hint_terms) if hint_terms else None,
-            "length_hint": length_hint(length) if length is not None else None,
-            "schema_error": schema_error,
-        }
+        hits: dict[str, list[str]] = {}
+        length: int | None = None
+        failed_schema: str | None = None
         try:
-            explanation = _explain(client, model, target.context, **hints)
+            explanation = _explain(
+                client, model, target.context, banned_hint=banned_hint, length_hint=hint_for_length, schema_error=schema_error
+            )
             hits, length = _problems(explanation)
         except ValueError as exc:
-            outcome.discarded = f"{target.label}: (스키마 실패) {str(exc)[:200]}"
-            return outcome
-        if hits:
-            outcome.hits = hits
-            outcome.discarded = f"{target.label}: 금지어 재발 {hits}"
-            return outcome
-        if length is not None:
+            failed_schema = str(exc)
+
+        if failed_schema:
+            reason, detail = REASON_SCHEMA, f"스키마 실패: {failed_schema[:120]}"
+        elif hits:
+            reason, detail = REASON_BANNED, f"금지어 {hits}" + (f" · 길이 {length}자" if length is not None else "")
+        elif length is not None:
+            reason, detail = REASON_LENGTH, f"길이 {length}자"
+        else:
+            break  # 문제 없음
+
+        repeated = reason in used
+        if repeated or sum(outcome.regenerations.values()) >= MAX_REGENERATIONS:
+            why = "재발" if repeated else f"재생성 한도 {MAX_REGENERATIONS}회 소진"
+            if reason == REASON_SCHEMA:
+                outcome.discarded = f"{target.label}: (스키마 실패) {why} — {failed_schema[:200]}"
+                return outcome
+            if reason == REASON_BANNED:
+                outcome.hits = hits
+                outcome.discarded = f"{target.label}: 금지어 {why} {hits}"
+                return outcome
             outcome.notes.append(f"{target.label}: explanation {length}자 — {MIN_LENGTH}~{MAX_LENGTH}자 범위 밖이지만 채택")
+            break
+
+        used.add(reason)
+        outcome.regenerations[reason] += 1
+        log(f"  {target.label}: 재생성({reason}) — {detail}")
+        if hits:
+            banned_hint = regeneration_hint([term for terms in hits.values() for term in terms])
+        # 길이 힌트는 마지막으로 본 응답 기준. 스키마 실패면 길이를 모르니 이전 힌트를 그대로 둔다
+        if length is not None:
+            hint_for_length = length_hint(length)
+        elif explanation is not None and not failed_schema:
+            hint_for_length = None
+        schema_error = failed_schema
 
     assert explanation is not None
     limitation = ensure_limitation(explanation.limitation, target.confirmed)
@@ -227,6 +257,9 @@ def _new_stats(stock_code: str | None, targets: int, below_threshold: int) -> di
         "below_threshold": below_threshold,
         "attempts": 0,
         "regenerated": 0,
+        "regenerated_banned": 0,
+        "regenerated_schema": 0,
+        "regenerated_length": 0,
         "published": 0,
         "grades": dict.fromkeys(GRADES, 0),
         "capped": 0,
@@ -368,6 +401,8 @@ def publish_alerts(
             outcome = explain_target(client, model, target, log=log)
             stats["attempts"] += outcome.attempts
             stats["regenerated"] += int(outcome.regenerated)
+            for reason, count in outcome.regenerations.items():
+                stats[f"regenerated_{reason}"] += count
             notes.extend(outcome.notes)
             stats["length_noted"] += sum("범위 밖" in note for note in outcome.notes)
             if outcome.explanation is None:
