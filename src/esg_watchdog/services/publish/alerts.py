@@ -2,7 +2,10 @@
 
 - 대상: matches(status 'accepted', relation ∈ ALERT_RELATIONS, scores not null, alert 없음, scores.materiality ≥ MIN_PUBLISH_MATERIALITY).
   회사(--company)를 주면 그 회사만. 하한 미달은 폐기가 아니라 대상에서 빠질 뿐이고(matches 는 accepted 유지) 건수만 stage_stats.below_threshold 에 남긴다(D-16).
-  첫 줄 출력: "대상 N건(하한 미달 제외 M건) → 등급 심각 a · 경고 b · 주의 c" — 등급 미리보기는 미확정 '주의' 캡을 적용한 값.
+- 같은 사건 억제(D-16): 같은 event_id 에는 경보를 최대 --per-event(기본 DEFAULT_PER_EVENT=1)건만 낸다. 남길 기준은 materiality 내림차순 →
+  confidence 내림차순 → match_id 오름차순. DB 에 이미 그 사건으로 발행된 alert(published)도 개수에 넣어 센다(재실행 시 중복 증식 방지).
+  억제된 matches 는 status 를 바꾸지 않고 accepted 로 둔다 — 나중에 --per-event 를 올리면 발행된다. 건수는 stage_stats.suppressed_same_event.
+  첫 줄 출력: "대상 N건(하한 미달 제외 M건 · 같은 사건 억제 K건) → 등급 심각 a · 경고 b · 주의 c" — 등급 미리보기는 미확정 '주의' 캡을 적용한 값.
 - grade: GRADE_THRESHOLDS(knowledge/weights.py) 로 scores.materiality 를 등급화하고, event.confirmed false 면 '주의' 로 캡(D-08 ②).
 - LLM(llm_model_judge) → AlertExplanation → banned_terms.check_fields(applies_to 4필드). 문제는 세 사유로 나눠 사유별 1회씩, 경보당 합계
   MAX_REGENERATIONS(2)회까지 힌트를 붙여 재생성한다(LLM 최대 3회). 같은 사유가 두 번이면 — 금지어: 폐기 + note(match_id, hits) ·
@@ -14,7 +17,7 @@
 - pipeline_runs(stage='publish', trigger='manual'). 경보 단위 예외 격리. DB·settings import 는 함수 안에서만.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -54,6 +57,8 @@ REASON_SCHEMA = "schema"
 REASON_LENGTH = "length"
 REASONS = (REASON_BANNED, REASON_SCHEMA, REASON_LENGTH)
 MAX_REGENERATIONS = 2
+# 같은 event_id 에 내는 경보 상한 기본값 (--per-event, D-16). 실측: 발행 20건 중 절반이 같은 사건에 공약만 다른 경보였다
+DEFAULT_PER_EVENT = 1
 
 Log = Callable[[str], None]
 
@@ -105,15 +110,66 @@ class PublishTarget:
     confirmed: bool
     materiality: int
     context: AlertContext
+    # 같은 사건 억제용 (event 별 상한 · 남길 순서)
+    event_id: int = 0
+    confidence: int = 0
 
     @property
     def label(self) -> str:
         return f"match {self.match_id}"
 
     @property
+    def rank(self) -> tuple[int, int, int]:
+        """같은 사건에서 남길 순서: materiality 내림차순 → confidence 내림차순 → match_id 오름차순."""
+        return (-self.materiality, -self.confidence, self.match_id)
+
+    @property
     def grade(self) -> str:
         """발행될 등급(미확정 캡 적용). alert_values 와 같은 계산."""
         return cap_grade(grade_for(self.materiality), self.confirmed)
+
+
+@dataclass
+class TargetSet:
+    """_load_targets 결과. existing_alerts 는 event_id → 이미 발행된(published) alert 수."""
+
+    label: str
+    targets: list[PublishTarget]
+    below_threshold: int = 0
+    existing_alerts: dict[int, int] = field(default_factory=dict)
+
+
+def suppress_same_event(
+    targets: Sequence[PublishTarget], existing_alerts: Mapping[int, int], per_event: int
+) -> tuple[list[PublishTarget], list[PublishTarget]]:
+    """같은 event_id 는 최대 per_event 건(기존 alert 포함). (남긴 대상 match_id 순, 억제된 대상 rank 순)."""
+    counts: dict[int, int] = {int(event_id): int(count) for event_id, count in existing_alerts.items()}
+    kept: list[PublishTarget] = []
+    suppressed: list[PublishTarget] = []
+    for target in sorted(targets, key=lambda item: item.rank):
+        if counts.get(target.event_id, 0) >= per_event:
+            suppressed.append(target)
+            continue
+        counts[target.event_id] = counts.get(target.event_id, 0) + 1
+        kept.append(target)
+    kept.sort(key=lambda item: item.match_id)
+    return kept, suppressed
+
+
+def suppression_lines(kept: Sequence[PublishTarget], suppressed: Sequence[PublishTarget], per_event: int) -> list[str]:
+    """억제 내역을 사건별로 한 줄씩 — 어떤 match 를 남기고 어떤 match 를 눌렀는지."""
+    kept_by_event: dict[int, list[PublishTarget]] = {}
+    for target in kept:
+        kept_by_event.setdefault(target.event_id, []).append(target)
+    suppressed_by_event: dict[int, list[PublishTarget]] = {}
+    for target in suppressed:
+        suppressed_by_event.setdefault(target.event_id, []).append(target)
+    lines = []
+    for event_id, targets in suppressed_by_event.items():
+        kept_text = " · ".join(f"{item.match_id}({item.materiality})" for item in kept_by_event.get(event_id, [])) or "기존 alert"
+        dropped = " · ".join(f"{item.match_id}({item.materiality})" for item in targets)
+        lines.append(f"[publish] 같은 사건 억제(--per-event {per_event}): event {event_id} → 남김 {kept_text} · 억제 {dropped}")
+    return lines
 
 
 def grade_counts(targets: Sequence[PublishTarget]) -> dict[str, int]:
@@ -124,12 +180,12 @@ def grade_counts(targets: Sequence[PublishTarget]) -> dict[str, int]:
     return counts
 
 
-def targets_line(label: str, targets: Sequence[PublishTarget], below_threshold: int) -> str:
-    """publish 첫 줄: 대상 N건(하한 미달 제외 M건) → 등급 심각 a · 경고 b · 주의 c."""
+def targets_line(label: str, targets: Sequence[PublishTarget], below_threshold: int, suppressed: int = 0) -> str:
+    """publish 첫 줄: 대상 N건(하한 미달 제외 M건 · 같은 사건 억제 K건) → 등급 심각 a · 경고 b · 주의 c."""
     counts = grade_counts(targets)
     grades = " · ".join(f"{grade} {counts[grade]}" for grade in reversed(GRADES))
     return (
-        f"[publish] {label}: 대상 {len(targets)}건(하한 미달 제외 {below_threshold}건) → 등급 {grades} "
+        f"[publish] {label}: 대상 {len(targets)}건(하한 미달 제외 {below_threshold}건 · 같은 사건 억제 {suppressed}건) → 등급 {grades} "
         f"(accepted · {'/'.join(ALERT_RELATIONS)} · materiality ≥ {MIN_PUBLISH_MATERIALITY} · alert 없음 → LLM 호출 {len(targets)}회)"
     )
 
@@ -250,11 +306,13 @@ class PublishResult:
     stats: dict = field(default_factory=dict)
 
 
-def _new_stats(stock_code: str | None, targets: int, below_threshold: int) -> dict:
+def _new_stats(stock_code: str | None, targets: int, below_threshold: int, suppressed: int, per_event: int) -> dict:
     return {
         "company": stock_code or "all",
         "targets": targets,
         "below_threshold": below_threshold,
+        "suppressed_same_event": suppressed,
+        "per_event": per_event,
         "attempts": 0,
         "regenerated": 0,
         "regenerated_banned": 0,
@@ -272,8 +330,25 @@ def _new_stats(stock_code: str | None, targets: int, below_threshold: int) -> di
     }
 
 
-def _load_targets(stock_code: str | None) -> tuple[str, list[PublishTarget], int]:
-    """(라벨, 대상, 하한 미달로 제외한 수). 하한은 컨텍스트(문서·언론사 조회)를 만들기 전에 건다."""
+def _existing_alert_counts(session, event_ids: set[int]) -> dict[int, int]:
+    """event_id → 이미 발행된(published) alert 수. 같은 사건 억제가 재실행에서도 증식하지 않게 한다."""
+    from sqlalchemy import func, select
+
+    from esg_watchdog.models import Alert, Match
+
+    if not event_ids:
+        return {}
+    rows = session.execute(
+        select(Match.event_id, func.count(Alert.id))
+        .join(Alert, Alert.match_id == Match.id)
+        .where(Match.event_id.in_(sorted(event_ids)), Alert.status == ALERT_STATUS)
+        .group_by(Match.event_id)
+    ).all()
+    return {int(event_id): int(count) for event_id, count in rows}
+
+
+def _load_targets(stock_code: str | None) -> TargetSet:
+    """대상(하한 통과) · 하한 미달 수 · 사건별 기존 alert 수. 하한은 컨텍스트(문서·언론사 조회)를 만들기 전에 건다."""
     from sqlalchemy import exists, select
 
     from esg_watchdog.db import SessionLocal
@@ -323,6 +398,8 @@ def _load_targets(stock_code: str | None) -> tuple[str, list[PublishTarget], int
                     company_id=company.id,
                     confirmed=bool(event.confirmed),
                     materiality=materiality,
+                    event_id=int(event.id),
+                    confidence=int(scores.get("confidence") or 0),
                     context=AlertContext(
                         company_name=company.name,
                         commitment=AlertCommitment(
@@ -350,7 +427,8 @@ def _load_targets(stock_code: str | None) -> tuple[str, list[PublishTarget], int
                     ),
                 )
             )
-    return label, targets, below_threshold
+        existing = _existing_alert_counts(session, {target.event_id for target in targets})
+    return TargetSet(label=label, targets=targets, below_threshold=below_threshold, existing_alerts=existing)
 
 
 def _insert_alert(values: dict) -> bool:
@@ -372,9 +450,10 @@ def publish_alerts(
     client: LLMClient | None = None,
     model: str | None = None,
     now: datetime | None = None,
+    per_event: int = DEFAULT_PER_EVENT,
     log: Log = print,
 ) -> PublishResult:
-    """경보 발행 한 번 실행. 경보 단위로 예외를 격리하고 pipeline_runs 에 기록한다."""
+    """경보 발행 한 번 실행. 같은 사건은 per_event 건까지만. 경보 단위로 예외를 격리하고 pipeline_runs 에 기록한다."""
     from sqlalchemy.exc import SQLAlchemyError
 
     if client is None:
@@ -386,11 +465,16 @@ def publish_alerts(
     # 키·공급자 설정 오류는 pipeline_runs 를 만들기 전에 낸다
     provider_name = client.provider.name
 
-    label, targets, below_threshold = _load_targets(stock_code)
-    log(targets_line(label, targets, below_threshold))
+    if per_event < 1:
+        raise ValueError(f"--per-event 는 1 이상이어야 한다: {per_event}")
+    loaded = _load_targets(stock_code)
+    targets, suppressed = suppress_same_event(loaded.targets, loaded.existing_alerts, per_event)
+    log(targets_line(loaded.label, targets, loaded.below_threshold, len(suppressed)))
+    for line in suppression_lines(targets, suppressed, per_event):
+        log(line)
 
     run_id = start_run(STAGE)
-    stats = _new_stats(stock_code, len(targets), below_threshold)
+    stats = _new_stats(stock_code, len(targets), loaded.below_threshold, len(suppressed), per_event)
     notes: list[str] = []
     failed: list[str] = []
     calls_before, hits_before = client.stats["calls"], client.stats["cache_hits"]

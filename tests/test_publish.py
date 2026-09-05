@@ -1,8 +1,11 @@
 """services/publish/alerts.py — 가짜 LLM 으로 금지어 → 재생성 → 폐기, 길이 재생성 → 채택+note, confirmed false → '주의' 캡, 미확정 limitation 강제,
 등급 임계값 60/45/30 · 발행 하한 30(미달은 대상 제외 + stage_stats.below_threshold), 사유별 재생성 예산(금지어 → 스키마 실패 → 성공이 살아남고
-같은 사유 두 번이면 폐기, stage_stats 사유별 분리) 을 DB 없이 검사한다 (D-08 · D-16 · D-17)."""
+같은 사유 두 번이면 폐기, stage_stats 사유별 분리), 같은 사건 억제(--per-event · 기존 alert 포함 · 억제된 match 는 accepted 유지) 을
+DB 없이 검사한다 (D-08 · D-16 · D-17)."""
 
 from datetime import date, datetime
+
+import pytest
 
 from esg_watchdog.knowledge.banned_terms import load_banned_terms
 from esg_watchdog.knowledge.weights import GRADE_THRESHOLDS, MIN_PUBLISH_MATERIALITY
@@ -124,11 +127,11 @@ def test_below_threshold_targets_are_excluded_not_discarded_and_first_line_shows
     finished: dict = {}
     # _load_targets 가 하한(≥30)을 이미 걸러 (대상, 제외 수) 를 돌려준 상태를 흉내낸다 — 제외 19건은 대조군 오뚜기의 약한 '후퇴'
     targets = [
-        target(match_id=1, materiality=60, confirmed=True, context=context(scores={"materiality": 60, "confidence": 65, "components": {}})),
-        target(match_id=2, materiality=45, confirmed=False, context=context(scores={"materiality": 45, "confidence": 65, "components": {}})),
-        target(match_id=3, materiality=30, confirmed=True, context=context(scores={"materiality": 30, "confidence": 65, "components": {}})),
+        target(match_id=1, event_id=2001, materiality=60, confirmed=True, context=context(scores={"materiality": 60, "confidence": 65, "components": {}})),
+        target(match_id=2, event_id=2002, materiality=45, confirmed=False, context=context(scores={"materiality": 45, "confidence": 65, "components": {}})),
+        target(match_id=3, event_id=2003, materiality=30, confirmed=True, context=context(scores={"materiality": 30, "confidence": 65, "components": {}})),
     ]
-    monkeypatch.setattr(svc, "_load_targets", lambda stock_code: ("전체", targets, 19))
+    monkeypatch.setattr(svc, "_load_targets", lambda stock_code: svc.TargetSet("전체", targets, below_threshold=19))
     monkeypatch.setattr(svc, "start_run", lambda stage: 77)
     monkeypatch.setattr(svc, "finish_run", lambda run_id, status, stats, note=None: finished.update(run_id=run_id, status=status, stats=stats, note=note))
     monkeypatch.setattr(svc, "_insert_alert", lambda values: saved.append(values) or True)
@@ -137,7 +140,7 @@ def test_below_threshold_targets_are_excluded_not_discarded_and_first_line_shows
     result = svc.publish_alerts(client=client, model="m", now=datetime(2026, 9, 5, 9, 0, tzinfo=KST), log=lines.append)
 
     assert lines[0] == (
-        "[publish] 전체: 대상 3건(하한 미달 제외 19건) → 등급 심각 1 · 경고 0 · 주의 2 "
+        "[publish] 전체: 대상 3건(하한 미달 제외 19건 · 같은 사건 억제 0건) → 등급 심각 1 · 경고 0 · 주의 2 "
         "(accepted · 위반/후퇴/이행지연 · materiality ≥ 30 · alert 없음 → LLM 호출 3회)"
     )
     assert len(fake.calls) == 3 and [values["grade"] for values in saved] == ["심각", "주의", "주의"]  # 45점 미확정 → 캡
@@ -148,7 +151,101 @@ def test_below_threshold_targets_are_excluded_not_discarded_and_first_line_shows
     assert result.status == "success" and finished["run_id"] == 77 and finished["stats"]["below_threshold"] == 19
     # 미리보기 헬퍼 — 대상이 없으면 전부 0
     assert svc.grade_counts([]) == {"주의": 0, "경고": 0, "심각": 0}
-    assert svc.targets_line("KT(030200)", [], 5).startswith("[publish] KT(030200): 대상 0건(하한 미달 제외 5건) → 등급 심각 0 · 경고 0 · 주의 0")
+    assert svc.targets_line("KT(030200)", [], 5, 2).startswith("[publish] KT(030200): 대상 0건(하한 미달 제외 5건 · 같은 사건 억제 2건) → 등급 심각 0 · 경고 0 · 주의 0")
+
+
+# --------------------------------------------------------------------------- 같은 사건 억제 (D-16)
+def same_event_targets() -> list[svc.PublishTarget]:
+    """event 2005 에 매칭 3건(공약만 다름) + event 2006 에 1건. 프롬프트가 달라야 캐시가 겹치지 않으므로 scores 를 다르게 둔다."""
+    return [
+        target(match_id=3011, event_id=2005, materiality=71, confidence=70, context=context(scores={"materiality": 71, "confidence": 70, "components": {}})),
+        target(match_id=3012, event_id=2005, materiality=65, confidence=80, context=context(scores={"materiality": 65, "confidence": 80, "components": {}})),
+        target(match_id=3013, event_id=2005, materiality=71, confidence=60, context=context(scores={"materiality": 71, "confidence": 60, "components": {}})),
+        target(match_id=3014, event_id=2006, materiality=50, confidence=50, context=context(scores={"materiality": 50, "confidence": 50, "components": {}})),
+    ]
+
+
+def test_suppress_same_event_keeps_by_materiality_then_confidence_then_match_id():
+    assert svc.DEFAULT_PER_EVENT == 1
+    kept, suppressed = svc.suppress_same_event(same_event_targets(), {}, per_event=1)
+    assert [item.match_id for item in kept] == [3011, 3014]  # 71/70 이 71/60 · 65/80 보다 앞
+    assert [item.match_id for item in suppressed] == [3013, 3012]  # rank 순: 71/60 → 65/80
+    kept, suppressed = svc.suppress_same_event(same_event_targets(), {}, per_event=2)
+    assert [item.match_id for item in kept] == [3011, 3013, 3014] and [item.match_id for item in suppressed] == [3012]
+    kept, _ = svc.suppress_same_event(same_event_targets(), {}, per_event=3)
+    assert len(kept) == 4
+    # materiality · confidence 가 같으면 match_id 오름차순
+    tie = [target(match_id=9, event_id=1, materiality=50, confidence=50), target(match_id=8, event_id=1, materiality=50, confidence=50)]
+    kept, suppressed = svc.suppress_same_event(tie, {}, per_event=1)
+    assert kept[0].match_id == 8 and suppressed[0].match_id == 9
+
+
+def test_suppress_same_event_counts_existing_alerts_in_db():
+    # event 2005 에 이미 alert 1건 → per_event 1 이면 세 건 모두 억제, per_event 2 면 한 건만 추가
+    kept, suppressed = svc.suppress_same_event(same_event_targets(), {2005: 1}, per_event=1)
+    assert [item.match_id for item in kept] == [3014] and len(suppressed) == 3
+    kept, suppressed = svc.suppress_same_event(same_event_targets(), {2005: 1}, per_event=2)
+    assert [item.match_id for item in kept] == [3011, 3014] and len(suppressed) == 2
+    # 기존 alert 가 상한을 이미 넘어도 터지지 않는다
+    kept, suppressed = svc.suppress_same_event(same_event_targets(), {2005: 5, 2006: 1}, per_event=1)
+    assert kept == [] and len(suppressed) == 4
+    lines = svc.suppression_lines(kept, suppressed, per_event=1)
+    assert lines[0].startswith("[publish] 같은 사건 억제(--per-event 1): event 2005 → 남김 기존 alert · 억제 3011(71) · 3013(71) · 3012(65)")
+
+
+def publish_with(monkeypatch, tmp_path, *, targets, existing, per_event, responses):
+    lines: list[str] = []
+    saved: list[dict] = []
+    finished: dict = {}
+    monkeypatch.setattr(svc, "_load_targets", lambda stock_code: svc.TargetSet("SPC삼립(005610)", targets, existing_alerts=existing))
+    monkeypatch.setattr(svc, "start_run", lambda stage: 79)
+    monkeypatch.setattr(svc, "finish_run", lambda run_id, status, stats, note=None: finished.update(stats=stats, note=note))
+    monkeypatch.setattr(svc, "_insert_alert", lambda values: saved.append(values) or True)
+    client, fake = make_client(tmp_path, responses)
+    result = svc.publish_alerts(stock_code="005610", client=client, model="m", now=datetime(2026, 9, 5, 9, 0, tzinfo=KST), per_event=per_event, log=lines.append)
+    return result, lines, saved, fake, finished
+
+
+def test_publish_suppresses_same_event_and_reports_it(monkeypatch, tmp_path):
+    result, lines, saved, fake, finished = publish_with(
+        monkeypatch, tmp_path / "one", targets=same_event_targets(), existing={}, per_event=1, responses=[explanation(), explanation()]
+    )
+    assert lines[0].startswith("[publish] SPC삼립(005610): 대상 2건(하한 미달 제외 0건 · 같은 사건 억제 2건) → 등급 심각 1 · 경고 1 · 주의 0")
+    assert lines[1] == "[publish] 같은 사건 억제(--per-event 1): event 2005 → 남김 3011(71) · 억제 3013(71) · 3012(65)"
+    assert [values["match_id"] for values in saved] == [3011, 3014] and len(fake.calls) == 2  # 억제된 건은 LLM 도 부르지 않는다
+    stats = result.stats
+    assert stats["targets"] == 2 and stats["suppressed_same_event"] == 2 and stats["per_event"] == 1 and stats["published"] == 2
+    assert finished["stats"]["suppressed_same_event"] == 2 and result.status == "success"
+
+    # --per-event 2 → 같은 사건에 두 건
+    result, lines, saved, fake, _ = publish_with(
+        monkeypatch, tmp_path / "two", targets=same_event_targets(), existing={}, per_event=2, responses=[explanation()] * 3
+    )
+    assert [values["match_id"] for values in saved] == [3011, 3013, 3014] and result.stats["suppressed_same_event"] == 1
+    assert "같은 사건 억제 1건" in lines[0]
+
+    # 이미 발행된 alert 가 있으면 추가 발행 억제 (재실행 시 중복 증식 방지)
+    result, lines, saved, fake, _ = publish_with(
+        monkeypatch, tmp_path / "existing", targets=same_event_targets()[:3], existing={2005: 1}, per_event=1, responses=[]
+    )
+    assert saved == [] and len(fake.calls) == 0 and result.stats["suppressed_same_event"] == 3 and result.stats["targets"] == 0
+    assert result.status == "success" and "대상 0건(하한 미달 제외 0건 · 같은 사건 억제 3건)" in lines[0]
+
+
+def test_publish_rejects_per_event_below_one(monkeypatch, tmp_path):
+    client, _ = make_client(tmp_path, [])
+    with pytest.raises(ValueError, match="--per-event"):
+        svc.publish_alerts(client=client, model="m", per_event=0, log=lambda _line: None)
+
+
+def test_cli_publish_per_event_argument():
+    from esg_watchdog import cli
+
+    args = cli.build_parser().parse_args(["publish"])
+    assert args.per_event == svc.DEFAULT_PER_EVENT == 1 and args.company is None
+    assert cli.build_parser().parse_args(["publish", "--company", "005610", "--per-event", "2"]).per_event == 2
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["publish", "--per-event", "0"])
 
 
 # --------------------------------------------------------------------------- 금지어 → 재생성 → 폐기 (D-17)
@@ -275,10 +372,10 @@ def test_total_regeneration_cap_is_two(tmp_path):
 def test_stage_stats_split_regenerations_by_reason(monkeypatch, tmp_path):
     finished: dict = {}
     targets = [
-        target(match_id=1, materiality=60, context=context(scores={"materiality": 60, "confidence": 65, "components": {}})),
-        target(match_id=2, materiality=45, context=context(scores={"materiality": 45, "confidence": 65, "components": {}})),
+        target(match_id=1, event_id=2001, materiality=60, context=context(scores={"materiality": 60, "confidence": 65, "components": {}})),
+        target(match_id=2, event_id=2002, materiality=45, context=context(scores={"materiality": 45, "confidence": 65, "components": {}})),
     ]
-    monkeypatch.setattr(svc, "_load_targets", lambda stock_code: ("전체", targets, 0))
+    monkeypatch.setattr(svc, "_load_targets", lambda stock_code: svc.TargetSet("전체", targets))
     monkeypatch.setattr(svc, "start_run", lambda stage: 78)
     monkeypatch.setattr(svc, "finish_run", lambda run_id, status, stats, note=None: finished.update(stats=stats, note=note))
     monkeypatch.setattr(svc, "_insert_alert", lambda values: True)

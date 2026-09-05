@@ -9,7 +9,7 @@
 - match --company <code> [--per-commitment N] [--limit N] [--dry-run] (F-04): 후보 SQL(카테고리 일치 → sub_tags 교집합 → 공약당 상한)
   → LLM 관계 판정 → matches. --dry-run 은 LLM 없이 회사·카테고리별 3단계 후보 수만 표로 출력(--company 생략 시 활성 기업 전부)
 - score [--company <code>] (F-05): matches.scores 전체 재계산 (LLM 없음, D-15)
-- publish [--company <code>] (F-06): accepted 매칭 → 등급 · 설명문 · 금지어 필터 → alerts
+- publish [--company <code>] [--per-event N] (F-06): accepted 매칭 → 등급 · 설명문 · 금지어 필터 → alerts. 같은 사건은 N건(기본 1)까지만
 - run-all --company <code> [--detect-limit N]: collect news · filings → extract → detect → match → score → publish. 한 단계 실패 시 중단
 DB 엔진·boto3 등 무거운 import 는 서브커맨드 함수 안에서만 한다 (--help 와 import 는 .env 없이 동작).
 pipeline_runs.trigger 는 전부 'manual' (cron 없음).
@@ -22,8 +22,9 @@ from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
 
-# 순수 상수만 가져온다 — candidates 는 DB·settings 를 함수 안에서만 읽어 .env 없이 import 된다
+# 순수 상수만 가져온다 — 두 모듈 모두 DB·settings 를 함수 안에서만 읽어 .env 없이 import 된다
 from esg_watchdog.services.match.candidates import DEFAULT_PER_COMMITMENT
+from esg_watchdog.services.publish.alerts import DEFAULT_PER_EVENT
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -567,6 +568,7 @@ def _print_publish(result) -> None:
     grades = " ".join(f"{name}={count}" for name, count in stats["grades"].items())
     print(
         f"\npublish: run={result.run_id} status={result.status} company={stats['company']} targets={stats['targets']} "
+        f"below_threshold={stats['below_threshold']} suppressed_same_event={stats['suppressed_same_event']} (per_event={stats['per_event']}) "
         f"llm_calls={stats['llm_calls']} cache_hits={stats['cache_hits']} regenerated={stats['regenerated']} "
         f"published={stats['published']} [{grades}] capped={stats['capped']} discarded={stats['discarded']} "
         f"length_noted={stats['length_noted']} skipped_existing={stats['skipped_existing']} errors={len(stats['errors'])}"
@@ -580,7 +582,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
     from esg_watchdog.services.publish.alerts import publish_alerts
 
     try:
-        result = publish_alerts(stock_code=args.company)
+        result = publish_alerts(stock_code=args.company, per_event=args.per_event)
     except (LookupError, ValueError, RuntimeError, SQLAlchemyError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return EXIT_ERROR
@@ -776,11 +778,19 @@ def build_parser() -> argparse.ArgumentParser:
         "publish",
         help="F-06 경보 발행: accepted 매칭(위반·후퇴·이행지연, scores 있음) → 등급 · 4단락 설명문 · 금지어 필터 → alerts (LLM_MODEL_JUDGE 필요, fake 가능)",
         description=(
-            "F-06 경보 발행. 등급은 GRADE_THRESHOLDS, 미확정 사건은 '주의' 캡. LLM 설명문 → 금지어 검사(걸리면 재생성 1회, 재발 시 폐기+note) "
-            "→ 길이 400~800자(벗어나면 재생성 1회, 재발 시 채택+note) → alerts(match_id UNIQUE)."
+            "F-06 경보 발행. 등급은 GRADE_THRESHOLDS, 미확정 사건은 '주의' 캡. 같은 사건(event_id)에는 --per-event 건까지만(기존 alert 포함, "
+            "나머지는 accepted 로 남겨 억제). LLM 설명문 → 금지어 검사(걸리면 재생성, 재발 시 폐기+note) "
+            "→ 길이 400~800자(벗어나면 재생성, 재발 시 채택+note) → alerts(match_id UNIQUE)."
         ),
     )
     publish.add_argument("--company", metavar="STOCK_CODE", help="한 회사만 (기본: 전체)")
+    publish.add_argument(
+        "--per-event",
+        type=_positive_int,
+        default=DEFAULT_PER_EVENT,
+        metavar="N",
+        help=f"같은 사건에 내는 경보 상한 (기본 {DEFAULT_PER_EVENT}). materiality → confidence → match_id 순으로 남긴다",
+    )
     publish.set_defaults(func=cmd_publish)
 
     run_all = subparsers.add_parser(
