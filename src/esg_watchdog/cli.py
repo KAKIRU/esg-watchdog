@@ -6,7 +6,8 @@
 - extract --company <code> | --document <id> (F-02): document_pages → commitments. LLM 은 배치에서만 부른다
 - detect --company <code> [--limit N] [--since D] [--until D] [--yes] [--all] (F-03): articles → events. 사전 필터 통과 M건 → 배치 K회 ·
   처리 구간을 먼저 출력, 200건 초과는 --yes 필요. --since/--until 은 published_at(KST 날짜) 창, 기본은 최근 12개월 전체
-- match --company <code> (F-04): 후보 SQL → LLM 관계 판정 → matches
+- match --company <code> [--per-commitment N] [--limit N] [--dry-run] (F-04): 후보 SQL(카테고리 일치 → sub_tags 교집합 → 공약당 상한)
+  → LLM 관계 판정 → matches. --dry-run 은 LLM 없이 회사·카테고리별 3단계 후보 수만 표로 출력(--company 생략 시 활성 기업 전부)
 - score [--company <code>] (F-05): matches.scores 전체 재계산 (LLM 없음, D-15)
 - publish [--company <code>] (F-06): accepted 매칭 → 등급 · 설명문 · 금지어 필터 → alerts
 - run-all --company <code> [--detect-limit N]: collect news · filings → extract → detect → match → score → publish. 한 단계 실패 시 중단
@@ -20,6 +21,9 @@ import sys
 from collections.abc import Sequence
 from datetime import date, datetime
 from pathlib import Path
+
+# 순수 상수만 가져온다 — candidates 는 DB·settings 를 함수 안에서만 읽어 .env 없이 import 된다
+from esg_watchdog.services.match.candidates import DEFAULT_PER_COMMITMENT
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -77,6 +81,13 @@ def _read_json(path: Path) -> list[dict]:
 
 def _to_date(value: str | None) -> date | None:
     return None if value is None else date.fromisoformat(value)
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"1 이상이어야 한다: {value}")
+    return number
 
 
 def _to_datetime(value: str) -> datetime:
@@ -481,22 +492,50 @@ def cmd_detect(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- match (F-04)
+def _print_match_preview(preview, *, per_commitment: int, limit: int | None) -> None:
+    """--dry-run 표: 회사·카테고리별 카테고리 일치(①) → sub_tags 교집합(②) → 상한 절단(③) 후보 수와 살아남은 쌍."""
+    print(f"[match --dry-run] per_commitment={per_commitment} limit={limit or '-'} — LLM 호출 없음, pipeline_runs 기록 없음")
+    rows = [
+        (row.company, row.category, row.funnel.by_category, row.funnel.by_tags, row.funnel.kept, row.funnel.truncated, row.funnel.limited)
+        for row in preview.rows
+    ]
+    total = preview.total
+    rows.append(("합계", "", total.by_category, total.by_tags, total.kept, total.truncated, total.limited))
+    _print_table(("회사", "cat", "카테고리 일치", "sub_tags 교집합", "상한 절단", "truncated", "limited"), rows)
+    print(f"\n살아남은 후보 {total.kept}건 (LLM 호출 {total.kept}회 예정):")
+    for company, candidate in preview.candidates:
+        event = candidate.event
+        print(
+            f"  {company} {candidate.commitment.category} {candidate.label} gap={candidate.gap_months} "
+            f"confirmed={'Y' if event.confirmed else 'N'} source_count={event.source_count} "
+            f"tags={'·'.join(candidate.commitment.sub_tags) or '-'} × {'·'.join(event.sub_tags) or '-'}"
+        )
+
+
 def cmd_match(args: argparse.Namespace) -> int:
     from sqlalchemy.exc import SQLAlchemyError
 
-    from esg_watchdog.services.match.judge import match_events
+    from esg_watchdog.services.match.judge import match_events, preview_candidates
 
+    if not args.company and not args.dry_run:
+        print("ERROR: --company 는 필수다 (--dry-run 만 생략 가능: 활성 기업 전부를 미리 본다)", file=sys.stderr)
+        return EXIT_ERROR
     try:
-        result = match_events(stock_code=args.company)
+        if args.dry_run:
+            preview = preview_candidates(stock_code=args.company, per_commitment=args.per_commitment, limit=args.limit)
+            _print_match_preview(preview, per_commitment=args.per_commitment, limit=args.limit)
+            return EXIT_OK
+        result = match_events(stock_code=args.company, per_commitment=args.per_commitment, limit=args.limit)
     except (LookupError, ValueError, RuntimeError, SQLAlchemyError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return EXIT_ERROR
     stats = result.stats
     relations = " ".join(f"{name}={count}" for name, count in stats["relations"].items())
     print(
-        f"\nmatch: run={result.run_id} status={result.status} candidates={stats['candidates']} llm_calls={stats['llm_calls']} "
-        f"cache_hits={stats['cache_hits']} regenerated={stats['regenerated']} judged={stats['judged']} upserted={stats['upserted']} "
-        f"[{relations}] enforced={stats['enforced']} discarded={stats['discarded']} errors={len(stats['errors'])}"
+        f"\nmatch: run={result.run_id} status={result.status} candidates={stats['candidates']} "
+        f"(by_category={stats['by_category']} by_tags={stats['by_tags']} truncated={stats['truncated']} limited={stats['limited']}) "
+        f"llm_calls={stats['llm_calls']} cache_hits={stats['cache_hits']} regenerated={stats['regenerated']} judged={stats['judged']} "
+        f"upserted={stats['upserted']} [{relations}] enforced={stats['enforced']} discarded={stats['discarded']} errors={len(stats['errors'])}"
     )
     _print_errors(stats["errors"])
     return EXIT_ERROR if result.status == "failed" else EXIT_OK
@@ -701,13 +740,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     match = subparsers.add_parser(
         "match",
-        help="F-04 매칭: 후보 SQL(같은 기업·category · 0<gap≤24) → LLM 관계 판정 → matches (LLM_PROVIDER · LLM_MODEL_JUDGE 필요, fake 가능)",
+        help=(
+            "F-04 매칭: 후보 SQL(같은 기업·category · 0<gap≤24 → sub_tags 교집합 → 공약당 상한) → LLM 관계 판정 → matches "
+            "(LLM_PROVIDER · LLM_MODEL_JUDGE 필요, fake 가능)"
+        ),
         description=(
-            "F-04 관계 판정. 후보마다 LLM 1회 → 인용 검사(실패 시 재생성 1회) → target_year 미도래 '위반' 은 '이행지연' 으로 강제 "
-            "→ matches(status accepted, scores 는 score 단계가 채움). '무관' 도 저장해 재판정하지 않는다."
+            "F-04 관계 판정. 후보 = ① 카테고리 일치(같은 기업·category · 0<gap≤24 · 기존 matches 제외) → ② sub_tags 교집합(한쪽이 비면 통과) "
+            f"→ ③ 공약당 상한(기본 {DEFAULT_PER_COMMITMENT}: confirmed → source_count → 기준일 최신순으로 남김) · --limit 전체 상한. "
+            "후보마다 LLM 1회 → 인용 검사(실패 시 재생성 1회) → target_year 미도래 '위반' 은 '이행지연' 으로 강제 "
+            "→ matches(status accepted, scores 는 score 단계가 채움). '무관' 도 저장해 재판정하지 않는다. "
+            "첫 줄에 '후보 N건(카테고리 일치 A → sub_tags 교집합 B → 상한 절단 C) → LLM 호출 N회' 를 출력한다."
         ),
     )
-    match.add_argument("--company", metavar="STOCK_CODE", required=True, help="한 회사")
+    match.add_argument("--company", metavar="STOCK_CODE", help="한 회사 (실행 시 필수. --dry-run 에서 생략하면 활성 기업 전부)")
+    match.add_argument(
+        "--per-commitment",
+        type=_positive_int,
+        default=DEFAULT_PER_COMMITMENT,
+        metavar="N",
+        help=f"공약당 후보 상한 (기본 {DEFAULT_PER_COMMITMENT}). 넘으면 confirmed=true → source_count 내림차순 → 기준일 최신순으로 남긴다",
+    )
+    match.add_argument("--limit", type=_positive_int, metavar="N", help="회사 전체 후보 상한 (같은 우선순위로 자른다). 기본: 없음")
+    match.add_argument("--dry-run", action="store_true", help="LLM 을 부르지 않고 회사·카테고리별 3단계 후보 수와 살아남은 쌍만 출력하고 종료")
     match.set_defaults(func=cmd_match)
 
     score = subparsers.add_parser(

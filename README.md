@@ -49,7 +49,7 @@ uv run esg-watchdog publish --company 030200
 | `collect --stage reports` | 로컬 PDF 의 지정 페이지만 → `documents` · `document_pages` | `--company --pdf --pages --title --fiscal-year --published-at` (전부 필수) · `--source-url` |
 | `extract` | `document_pages` → `commitments` (LLM · 인용 검사) | `--company` 또는 `--document ID` |
 | `detect` | pending `articles` → `events` (사전 필터 → 15건 배치 LLM → 인용 검사 → 중복 병합) | `--limit N` · `--since YYYY-MM-DD` · `--until YYYY-MM-DD` · `--all` · `--yes` |
-| `match` | 후보 SQL(같은 기업·같은 category·0<gap≤24) → LLM 관계 판정 → `matches` | `--company` |
+| `match` | 후보 SQL(같은 기업·같은 category·0<gap≤24 → `sub_tags` 교집합 → 공약당 상한) → LLM 관계 판정 → `matches` | `--company` · `--per-commitment N` (기본 5) · `--limit N` · `--dry-run` (LLM 없이 3단계 후보 수만 표로, `--company` 생략 시 전체) |
 | `score` | `matches.scores` 전체 재계산 (LLM 없음) | `--company` (없으면 전체) |
 | `publish` | accepted 매칭 → 등급 · 4단락 설명문 · 금지어 필터 → `alerts` | `--company` (없으면 전체) |
 | `run-all` | collect news · filings → extract → detect → match → score → publish. 한 단계 실패 시 중단 | `--company` · `--detect-limit N` (기본 300) |
@@ -57,6 +57,11 @@ uv run esg-watchdog publish --company 030200
 - `detect` 는 실행 첫 줄에 `pending N건 → 사전 필터 통과 M건 → 배치 K회 · 처리 구간: YYYY-MM-DD ~ YYYY-MM-DD` 를 출력한다.
   `--limit` 없이 M 이 200건을 넘으면 `--yes` 없이는 실행하지 않는다. `--since/--until` 은 `articles.published_at`(KST 날짜, until 포함)
   기준이고 기본은 최근 12개월 전체다. 창의 앞쪽만 처리하고 뒤가 비지 않도록 구간을 나눠 돌린다.
+- `match` 는 실행 첫 줄에 `후보 N건(카테고리 일치 A → sub_tags 교집합 B → 상한 절단 C) → LLM 호출 N회` 를 출력한다. 후보는
+  ① 카테고리 일치 → ② `commitments.sub_tags` 와 `events.sub_tags` 가 한 개 이상 겹침(한쪽이 빈 배열이면 통과, SQL `&&`) → ③ 공약당
+  상한(`--per-commitment`, 기본 5: confirmed=true → source_count 내림차순 → 기준일 최신순으로 남김) · `--limit` 전체 상한 순으로 좁힌다.
+  실측(9/2)에서 카테고리 일치만으로 3사 2,563건이 나와 도입했다. 잘린 후보는 `pipeline_runs.stage_stats.truncated/limited` 에 남고
+  다음 실행에서 다시 후보가 된다(판정된 쌍만 `matches` 로 제외). `--dry-run` 으로 회사·카테고리별 3단계 수와 살아남은 쌍을 먼저 본다.
 - **재실행 안전(멱등)**: 모든 단계는 다시 실행해도 같은 행을 두 번 만들지 않는다 — articles 는 url_hash, commitments 는
   (company_id, normalized_text), events 는 병합 키(category · event_type · 연-월), matches 는 (commitment_id, event_id), alerts 는 match_id.
   score 는 부분 재계산 없이 전량 다시 계산한다.

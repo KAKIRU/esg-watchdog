@@ -50,6 +50,8 @@ class CommitmentInput:
     target_value: float | None
     target_year: int | None
     filed_at: date
+    # 후보 축소(candidates ② 교집합)에만 쓴다 — 프롬프트에는 넣지 않는다
+    sub_tags: tuple[str, ...] = ()
 
 
 @dataclass
@@ -65,6 +67,9 @@ class EventInput:
     is_retrospective: bool
     confirmed: bool
     confirmed_basis: str | None
+    # 후보 축소(candidates ② 교집합 · ③ 상한 정렬)에만 쓴다 — 프롬프트에는 넣지 않는다
+    sub_tags: tuple[str, ...] = ()
+    source_count: int = 0
 
 
 class RelationJudgement(BaseModel):

@@ -1,6 +1,9 @@
 """F-04 관계 판정 — 후보마다 LLM(llm_model_judge) → 후처리 강제 → matches upsert (D-10 · D-11 · D-12).
 
-- 후보는 candidates.load_candidates(SQL). 후보마다 RelationJudgement 를 받아 다음을 강제한다:
+- 후보는 candidates.load_candidates(SQL): 카테고리 일치(①) → sub_tags 교집합(②) → 공약당 상한 · 전체 상한(③). 실행 첫 줄에
+  "후보 N건(카테고리 일치 A → sub_tags 교집합 B → 상한 절단 C) → LLM 호출 N회" 를 출력하고 stage_stats 에 by_category · by_tags ·
+  truncated · limited 를 남긴다. preview_candidates(--dry-run)는 LLM 클라이언트를 만들지 않고 pipeline_runs 도 쓰지 않는다.
+- 후보마다 RelationJudgement 를 받아 다음을 강제한다:
   (a) target_year > 올해 이고 relation == '위반' → '이행지연' 으로 바꾸고 rationale 끝에 PENDING_NOTE 를 붙인다.
   (b) is_retrospective 인데 rationale 에 "소급 확인" 이 없으면 RETRO_SENTENCE 를 붙인다.
   (c) quote_in(commitment_quote, commitment_text) 와 quote_in(event_quote, event.evidence_quote or event.summary) 둘 다 통과해야 한다.
@@ -24,7 +27,13 @@ from esg_watchdog.prompts.relation_judge import (
     RelationJudgement,
     build_user_prompt,
 )
-from esg_watchdog.services.match.candidates import Candidate, load_candidates
+from esg_watchdog.services.match.candidates import (
+    DEFAULT_PER_COMMITMENT,
+    Candidate,
+    CandidateSet,
+    Funnel,
+    load_candidates,
+)
 from esg_watchdog.services.runs import (
     decide_status,
     failure_note,
@@ -158,10 +167,16 @@ class MatchResult:
     stats: dict = field(default_factory=dict)
 
 
-def _new_stats(stock_code: str, candidates: int) -> dict:
+def _new_stats(stock_code: str, funnel: Funnel, *, per_commitment: int | None, limit: int | None) -> dict:
     return {
         "company": stock_code,
-        "candidates": candidates,
+        "candidates": funnel.kept,
+        "by_category": funnel.by_category,
+        "by_tags": funnel.by_tags,
+        "truncated": funnel.truncated,
+        "limited": funnel.limited,
+        "per_commitment": per_commitment,
+        "limit": limit,
         "attempts": 0,
         "regenerated": 0,
         "judged": 0,
@@ -175,7 +190,7 @@ def _new_stats(stock_code: str, candidates: int) -> dict:
     }
 
 
-def _load_company(stock_code: str):
+def _load_company(stock_code: str) -> tuple[int, str]:
     from sqlalchemy import select
 
     from esg_watchdog.db import SessionLocal
@@ -188,14 +203,75 @@ def _load_company(stock_code: str):
         return company.id, f"{company.name}({company.stock_code})"
 
 
-def _upsert_match(session, values: dict) -> None:
+def _load_active_companies() -> list[tuple[int, str]]:
+    """--dry-run 에서 --company 를 생략했을 때: companies.is_active 전부 (id 순)."""
+    from sqlalchemy import select
+
+    from esg_watchdog.db import SessionLocal
+    from esg_watchdog.models import Company
+
+    with SessionLocal() as session:
+        companies = session.scalars(select(Company).where(Company.is_active.is_(True)).order_by(Company.id)).all()
+    if not companies:
+        raise LookupError("companies 에 is_active 회사가 없다 — 먼저 `esg-watchdog seed-companies`")
+    return [(company.id, f"{company.name}({company.stock_code})") for company in companies]
+
+
+def _upsert_match(values: dict) -> None:
+    """matches upsert(commitment_id, event_id UNIQUE) — 세션은 여기서만 연다."""
     from sqlalchemy.dialects.postgresql import insert
 
+    from esg_watchdog.db import SessionLocal
     from esg_watchdog.models import Match
 
     stmt = insert(Match).values(**values)
     update_cols = {key: value for key, value in values.items() if key not in ("commitment_id", "event_id")}
-    session.execute(stmt.on_conflict_do_update(constraint="uq_matches_commitment_event", set_=update_cols))
+    with SessionLocal() as session:
+        session.execute(stmt.on_conflict_do_update(constraint="uq_matches_commitment_event", set_=update_cols))
+        session.commit()
+
+
+def funnel_line(funnel: Funnel) -> str:
+    """실행 첫 줄: 후보 N건(카테고리 일치 A → sub_tags 교집합 B → 상한 절단 C) → LLM 호출 N회."""
+    return (
+        f"후보 {funnel.kept}건(카테고리 일치 {funnel.by_category} → sub_tags 교집합 {funnel.by_tags} → 상한 절단 {funnel.kept}) "
+        f"→ LLM 호출 {funnel.kept}회"
+    )
+
+
+# --------------------------------------------------------------------------- dry-run
+@dataclass
+class PreviewRow:
+    company: str
+    category: str
+    funnel: Funnel
+
+
+@dataclass
+class Preview:
+    rows: list[PreviewRow] = field(default_factory=list)
+    candidates: list[tuple[str, Candidate]] = field(default_factory=list)  # (company label, 후보)
+
+    @property
+    def total(self) -> Funnel:
+        total = Funnel()
+        for row in self.rows:
+            total.add(row.funnel)
+        return total
+
+
+def preview_candidates(
+    *, stock_code: str | None = None, per_commitment: int | None = DEFAULT_PER_COMMITMENT, limit: int | None = None
+) -> Preview:
+    """--dry-run: LLM 을 부르지 않고 회사·카테고리별 3단계 후보 수와 살아남은 쌍을 돌려준다. pipeline_runs 에 쓰지 않는다.
+    stock_code 가 없으면 is_active 회사 전부. limit 은 회사마다 적용한다(실제 match 도 회사 단위라 같다)."""
+    companies = [_load_company(stock_code)] if stock_code else _load_active_companies()
+    preview = Preview()
+    for company_id, label in companies:
+        candidate_set: CandidateSet = load_candidates(company_id, per_commitment=per_commitment, limit=limit)
+        preview.rows.extend(PreviewRow(label, category, funnel) for category, funnel in candidate_set.per_category.items())
+        preview.candidates.extend((label, candidate) for candidate in candidate_set.candidates)
+    return preview
 
 
 def match_events(
@@ -205,11 +281,11 @@ def match_events(
     model: str | None = None,
     today: date | None = None,
     log: Log = print,
+    per_commitment: int | None = DEFAULT_PER_COMMITMENT,
+    limit: int | None = None,
 ) -> MatchResult:
     """관계 판정 한 번 실행. 후보 단위로 예외를 격리하고 pipeline_runs 에 기록한다."""
     from sqlalchemy.exc import SQLAlchemyError
-
-    from esg_watchdog.db import SessionLocal
 
     if client is None:
         client = LLMClient()
@@ -222,11 +298,15 @@ def match_events(
     today = today or now_kst().date()
 
     company_id, label = _load_company(stock_code)
-    candidates = load_candidates(company_id)
-    log(f"[match] {label}: 후보 {len(candidates)}건 (같은 category · 0<gap≤24 · 기존 matches 제외) → LLM 호출 {len(candidates)}회")
+    candidate_set = load_candidates(company_id, per_commitment=per_commitment, limit=limit)
+    candidates = candidate_set.candidates
+    funnel = candidate_set.total
+    log(f"[match] {label}: {funnel_line(funnel)}")
+    if funnel.truncated or funnel.limited:
+        log(f"[match] 절단: 공약당 상한 {per_commitment} 에 {funnel.truncated}건 · 전체 상한 {limit or '-'} 에 {funnel.limited}건")
 
     run_id = start_run(STAGE)
-    stats = _new_stats(stock_code, len(candidates))
+    stats = _new_stats(stock_code, funnel, per_commitment=per_commitment, limit=limit)
     notes: list[str] = []
     failed: list[str] = []
     calls_before, hits_before = client.stats["calls"], client.stats["cache_hits"]
@@ -246,9 +326,7 @@ def match_events(
             stats["enforced"] += len(outcome.enforced)
             notes.extend(f"강제: {item}" for item in outcome.enforced)
             values = match_values(candidate, outcome.judgement)
-            with SessionLocal() as session:
-                _upsert_match(session, values)
-                session.commit()
+            _upsert_match(values)
             stats["upserted"] += 1
             stats["relations"][values["relation"]] += 1
             log(f"  {candidate.label}: gap={candidate.gap_months} relation={values['relation']} confidence={values['llm_confidence']}")
