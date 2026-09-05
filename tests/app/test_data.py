@@ -1,4 +1,4 @@
-"""app/lib/data.py — DB 없이 fixture 모드로 조회 계약 v1 을 검사한다 (D-31 · D-35)."""
+"""app/lib/data.py — DB 없이 fixture 모드로 조회 계약 v1 을 검사한다 (D-31 · D-35). 근거 링크 정렬(기업 언급 제목 우선 → 날짜순)도 여기서."""
 
 import json
 import os
@@ -131,14 +131,70 @@ def test_get_alerts_filters_grade_and_stock_codes():
     assert data.get_alerts({"stock_codes": ["007310"]}).empty
 
 
-def test_alert_4001_has_two_articles_in_source_order():
+def test_alert_4001_has_two_articles_both_mentioning_kt_in_date_order():
     detail = data.get_alert_detail(4001)
     assert detail is not None
     articles = detail["articles"]
     assert len(articles) == 2
-    assert articles["id"].tolist() == [103, 104]  # events 2003 sources 순서
+    assert articles["id"].tolist() == [103, 104]  # 둘 다 제목에 KT → published_at 오름차순 (sources 순서와 같다)
     assert list(articles.columns) == list(data.ARTICLE_COLUMNS)
     assert detail["match"]["scores"]["components"]["industry_weight"] == 34
+
+
+# --------------------------------------------------------------------------- 근거 링크 정렬 (D-31)
+def test_companies_aliases_column_is_filled_when_fixture_lacks_it():
+    companies = data._load("companies")
+    assert list(companies.columns) == list(data.COL["companies"]) and "aliases" in companies.columns
+    assert companies["aliases"].tolist() == [[], [], []]  # fixture 에는 없다 → 빈 배열. DB 에서는 companies.aliases
+    assert data._company_terms({"name": "SPC삼립", "aliases": ["SPC삼립", "삼립", " ", None]}) == ["SPC삼립", "삼립"]
+    assert data._company_terms({"name": "KT", "aliases": None}) == ["KT"]
+    assert data._company_terms({"name": None}) == []
+
+
+def articles_df(rows):
+    df = pd.DataFrame(rows, columns=["id", "url", "press", "title", "published_at"])
+    df["published_at"] = pd.to_datetime(df["published_at"], utc=True).dt.tz_convert(data.KST)
+    return df
+
+
+def test_sort_articles_company_mention_first_then_published_at():
+    rows = [
+        (1, "u1", "p", "1분기 담합 과징금 6891억원 총계", "2026-03-01T09:00:00+09:00"),
+        (2, "u2", "p", "삼립 공장 사고 보도", "2026-03-05T09:00:00+09:00"),
+        (3, "u3", "p", "CJ제일제당 설탕 담합 과징금", "2026-02-01T09:00:00+09:00"),
+        (4, "u4", "p", "SPC삼립 과징금 부과", "2026-03-02T09:00:00+09:00"),
+    ]
+    ordered = data._sort_articles(articles_df(rows), ["SPC삼립", "삼립"])
+    assert ordered["id"].tolist() == [4, 2, 3, 1]  # 기업 언급(날짜순) → 미언급(날짜순)
+    assert list(ordered.columns) == list(data.ARTICLE_COLUMNS)
+    # 기업 언급이 하나도 없으면 날짜순
+    assert data._sort_articles(articles_df(rows), ["오뚜기"])["id"].tolist() == [3, 1, 4, 2]
+    # 대소문자는 가리지 않는다 · 빈 DF 는 그대로
+    assert data._sort_articles(articles_df([(9, "u", "p", "kt 침해사고 일지", "2026-01-01T00:00:00+09:00")]), ["KT"])["id"].tolist() == [9]
+    assert data._sort_articles(articles_df([]), ["KT"]).empty
+
+
+def test_alert_detail_puts_company_mentioning_article_first(monkeypatch):
+    """event 2003 sources [103, 104]. 103 제목에서 KT 를 빼면 104 가 앞으로 온다. 둘 다 빼면 날짜순 [103, 104]."""
+    real_table = data._table
+
+    def without_kt(ids):
+        def table(name):
+            df = real_table(name)
+            if name == "articles":
+                df = df.copy()
+                df.loc[df["id"].isin(ids), "title"] = "1분기 담합 과징금 총계 (기업 미언급)"
+            return df
+
+        return table
+
+    monkeypatch.setattr(data, "_table", without_kt({103}))
+    detail = data.get_alert_detail(4001)
+    assert detail["articles"]["id"].tolist() == [104, 103]
+    monkeypatch.setattr(data, "_table", without_kt({103, 104}))
+    detail = data.get_alert_detail(4001)
+    assert detail["articles"]["id"].tolist() == [103, 104]  # 날짜순 (14:10 → 16:45)
+    assert detail["company"]["aliases"] == []
 
 
 def test_alert_4005_event_is_retrospective():

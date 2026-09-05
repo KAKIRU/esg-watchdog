@@ -2,7 +2,9 @@
 
 - app/ 는 파이프라인 패키지(src/)를 import 하지 않는다. 읽기 전용 DATABASE_URL 과 `SELECT *` 만 쓴다.
 - 화면은 COL 에 나열한 컬럼만 쓴다. DB 에는 그 밖의 컬럼(created_at · prompt_version …)이 더 있지만
-  _load 가 COL 로 잘라내므로 두 모드의 컬럼 집합은 같다.
+  _load 가 COL 로 잘라내므로 두 모드의 컬럼 집합은 같다. OPTIONAL_COL 은 fixture 에 없어도 기본값으로 채우는 컬럼(companies.aliases).
+- 경보 상세의 articles 는 제목에 그 기업의 이름·별칭이 든 기사를 앞에, 그 뒤는 published_at 오름차순 (D-31). 사건 병합 키가
+  (기업·카테고리·유형·연-월)이라 별칭으로 걸린 총계 기사가 sources 에 섞여 들어오는데, 화면에서는 기업이 언급된 원문부터 보인다.
 - 요청 시점 LLM 호출·배치 실행 없음. 테이블을 통째로 읽어 파이썬(pandas)으로 조인한다 — 3사 규모.
 - DB 접속 실패는 fixture 로 폴백하지 않는다(잘못된 데이터가 정답처럼 보이면 안 됨). 빈 DataFrame + 에러 한 줄.
 """
@@ -10,6 +12,7 @@
 import json
 import logging
 import os
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +31,7 @@ TABLES = ("companies", "commitments", "events", "matches", "alerts", "articles",
 
 # 이 파일이 쓰는 컬럼 전부 (테이블별). 컬럼명은 fixture JSON · 마이그레이션 3006cb2d39be 와 같다
 COL: dict[str, tuple[str, ...]] = {
-    "companies": ("id", "stock_code", "name", "industry_key", "is_control_group"),
+    "companies": ("id", "stock_code", "name", "industry_key", "is_control_group", "aliases"),
     "commitments": (
         "id", "company_id", "category", "sub_tags", "commitment_type", "commitment_text", "normalized_text",
         "metric", "target_value", "target_year", "baseline", "source", "filed_at", "status",
@@ -50,6 +53,8 @@ COL: dict[str, tuple[str, ...]] = {
     "documents": ("id", "company_id", "title", "fiscal_year", "published_at"),
 }
 
+# 원본에 없으면 기본값으로 채우는 컬럼. fixture companies.json 에는 aliases 가 없다(수정 금지) — DB(companies.aliases) 에는 있다
+OPTIONAL_COL: dict[str, dict[str, Callable[[], Any]]] = {"companies": {"aliases": list}}
 # 날짜 정규화. timestamptz 컬럼은 Asia/Seoul tz-aware, date 컬럼은 naive datetime — 두 모드 모두 같은 dtype 이 된다
 TIMESTAMP_COLS = {"alerts": ("published_at",), "articles": ("published_at",)}
 DATE_COLS = {"commitments": ("filed_at",), "events": ("event_date", "reported_at"), "documents": ("published_at",)}
@@ -111,7 +116,10 @@ def reset_error() -> None:
 
 # --------------------------------------------------------------------------- load
 def _normalize(table: str, df: pd.DataFrame) -> pd.DataFrame:
-    """COL 컬럼만 남기고 날짜·숫자 dtype 을 두 모드에서 같게 맞춘다."""
+    """COL 컬럼만 남기고 날짜·숫자 dtype 을 두 모드에서 같게 맞춘다. OPTIONAL_COL 은 없으면 기본값으로 채운다."""
+    for column, factory in OPTIONAL_COL.get(table, {}).items():
+        if column not in df.columns:
+            df = df.assign(**{column: pd.Series([factory() for _ in range(len(df))], index=df.index, dtype="object")})
     missing = [column for column in COL[table] if column not in df.columns]
     if missing:
         raise KeyError(f"{table}: 컬럼 없음 {missing}")
@@ -274,8 +282,29 @@ def get_company(stock_code: str) -> dict[str, Any] | None:
     }
 
 
+def _company_terms(company: Mapping[str, Any]) -> list[str]:
+    """제목 매칭에 쓰는 기업명 + 별칭(companies.aliases). 빈 값·중복 제거."""
+    aliases = company.get("aliases")
+    values = [company.get("name"), *(aliases if isinstance(aliases, (list, tuple)) else [])]
+    return list(dict.fromkeys(str(value).strip() for value in values if not _is_missing(value) and str(value).strip()))
+
+
+def _mentions(title: Any, terms: Sequence[str]) -> bool:
+    text = str(title).casefold() if not _is_missing(title) else ""
+    return any(term.casefold() in text for term in terms)
+
+
+def _sort_articles(articles: pd.DataFrame, terms: Sequence[str]) -> pd.DataFrame:
+    """① 제목에 기업명·별칭이 든 기사 먼저 ② published_at 오름차순. 같은 값이면 원래(sources) 순서 (D-31)."""
+    if articles.empty:
+        return articles
+    rank = articles["title"].map(lambda title: 0 if _mentions(title, terms) else 1)
+    ordered = articles.assign(_rank=rank).sort_values(["_rank", "published_at"], ascending=[True, True], kind="stable")
+    return ordered.drop(columns="_rank").reset_index(drop=True)
+
+
 def _articles_for(sources: Any) -> pd.DataFrame:
-    """events.sources(article id 배열) 순서대로 기사 행. 없는 id 는 건너뛴다."""
+    """events.sources(article id 배열) 순서대로 기사 행 — 정렬 전 기준 순서. 없는 id 는 건너뛴다."""
     articles = _table("articles")
     if not isinstance(sources, (list, tuple)) or len(sources) == 0 or articles.empty:
         return articles.iloc[0:0][list(ARTICLE_COLUMNS)].reset_index(drop=True)
@@ -285,7 +314,7 @@ def _articles_for(sources: Any) -> pd.DataFrame:
 
 
 def get_alert_detail(alert_id: Any) -> dict[str, Any] | None:
-    """경보 상세. alert · match · commitment · event · company: dict, articles: DF, document: dict(title · fiscal_year · published_at)."""
+    """경보 상세. alert · match · commitment · event · company: dict, articles: DF(기업 언급 제목 우선 → 날짜순), document: dict(title · fiscal_year · published_at)."""
     if _is_missing(alert_id):
         return None
     alert = _find(_table("alerts"), alert_id)
@@ -295,7 +324,7 @@ def get_alert_detail(alert_id: Any) -> dict[str, Any] | None:
     commitment = _find(_table("commitments"), match.get("commitment_id"))
     event = _find(_table("events"), match.get("event_id"))
     company = _find(_table("companies"), alert.get("company_id"))
-    articles = _articles_for(event.get("sources"))
+    articles = _sort_articles(_articles_for(event.get("sources")), _company_terms(company))
 
     source = commitment.get("source")
     doc_id = source.get("doc_id") if isinstance(source, dict) else None

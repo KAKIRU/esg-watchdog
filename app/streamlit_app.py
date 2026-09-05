@@ -20,6 +20,7 @@ logger = logging.getLogger("esg_app")
 
 TITLE = "공시와 현실 사이 — ESG 조기경보"
 PAGE_SIZE = 5  # 더보기 페이지 크기 (D-19)
+ARTICLE_PREVIEW = 5  # 근거 카드 ② 에 바로 보이는 원문 링크 수. 나머지는 "원문 N건 더 보기" 로 접는다 (D-31)
 CATEGORIES = ("E", "S", "G")
 GRADES = ("주의", "경고", "심각")
 GRADE_RANK = {grade: rank for rank, grade in enumerate(GRADES, start=1)}
@@ -31,7 +32,7 @@ DISCLAIMER = (
 )
 VIEWS = ("feed", "company", "alert")
 UNCONFIRMED_BADGE = "조사·의혹 단계 — 등급 상한 '주의'"
-# scores.components 표시 순서 (D-31: esg_watchdog 를 import 하지 않으므로 여기 둔다). jsonb 는 키 순서를 보존하지 않는다 —
+# scores.components 표시 순서 (D-31: 파이프라인 패키지(src/)를 import 하지 않으므로 여기 둔다). jsonb 는 키 순서를 보존하지 않는다 —
 # DB 모드에서 막대가 매번 다른 순서로 그려지지 않게 고정한다. 목록에 없는 키는 뒤에 알파벳순.
 COMPONENT_ORDER = ("industry_weight", "severity", "relation_coef", "confirmed_coef")
 COMPONENT_RANK = {key: rank for rank, key in enumerate(COMPONENT_ORDER)}
@@ -112,6 +113,10 @@ def score_bar(label: str, value: Any) -> None:
         st.markdown(f"{label} · —")
         return
     st.progress(bar, text=f"{label} · {fmt_number(value)}")
+
+
+def article_line(row: Any) -> str:
+    return f"- {text_or(row.press)} · [{text_or(row.title)}]({text_or(row.url)})"
 
 
 def ordered_components(components: dict) -> list[tuple[str, Any]]:
@@ -355,8 +360,14 @@ def render_alert(alert_id: Any) -> None:
         st.markdown(f"> {text_or(event.get('evidence_quote'), '근거 인용 없음')}")
         count = len(articles) if not articles.empty else fmt_number(event.get("source_count"), "0")
         st.caption(f"사건일 {fmt_date(event.get('event_date'), event.get('date_precision'))} · 보도 {count}건")
-        for row in articles.itertuples(index=False):
-            st.markdown(f"- {text_or(row.press)} · [{text_or(row.title)}]({text_or(row.url)})")
+        # data.get_alert_detail 이 기업 언급 제목 → 날짜순으로 정렬해 준다. 앞 ARTICLE_PREVIEW 건만 펼치고 나머지는 접는다
+        for row in articles.iloc[:ARTICLE_PREVIEW].itertuples(index=False):
+            st.markdown(article_line(row))
+        rest = articles.iloc[ARTICLE_PREVIEW:]
+        if not rest.empty:
+            with st.expander(f"원문 {len(rest)}건 더 보기"):
+                for row in rest.itertuples(index=False):
+                    st.markdown(article_line(row))
         if articles.empty:
             st.caption("원문 링크 없음")
 
