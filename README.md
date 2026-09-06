@@ -43,7 +43,7 @@ uv run esg-watchdog publish --company 030200
 | 명령 | 하는 일 | 주요 옵션 |
 |---|---|---|
 | `seed-companies` | knowledge.COMPANIES 3사를 stock_code 기준 upsert | `--deactivate-others` |
-| `load-fixtures` | `app/fixtures/*.json` 을 계약 테이블에 적재 (보험 · 씨앗) | `--dir` · `--truncate` · `--merge` |
+| `load-fixtures` | `app/fixtures/*.json` 을 계약 테이블에 적재 (보험 · 씨앗 — **9/6 동결 이후 실행 금지, D-44**) | `--dir` · `--truncate` · `--merge` |
 | `collect --stage news` | 네이버 뉴스 검색 → `articles` (별칭×키워드 44 · 제외어 · 12개월 · URL 정규화) | `--company` · `--max-pages` |
 | `collect --stage filings` | OpenDART 후속공시 목록 → `filings` (원문 미수집) | `--company` |
 | `collect --stage reports` | 로컬 PDF 의 지정 페이지만 → `documents` · `document_pages` | `--company --pdf --pages --title --fiscal-year --published-at` (전부 필수) · `--source-url` |
@@ -53,6 +53,13 @@ uv run esg-watchdog publish --company 030200
 | `score` | `matches.scores` 전체 재계산 (LLM 없음) | `--company` (없으면 전체) |
 | `publish` | accepted 매칭 → 등급 · 4단락 설명문 · 금지어 필터 → `alerts` | `--company` (없으면 전체) |
 | `run-all` | collect news · filings → extract → detect → match → score → publish. 한 단계 실패 시 중단 | `--company` · `--detect-limit N` (기본 300) |
+
+> ⚠️ **9/6 데이터 동결 이후 `load-fixtures` 를 실행하지 마라 (D-44).**
+> 씨앗 공약·사건은 실제 보고서 문장과 출처(`commitments.source` 의 `doc_id` · `page`)로
+> 교체돼 발행 경보 9건을 받치고 있다. `--merge` 는 씨앗 행을 되살려 실공약과 병존시키고,
+> `--truncate` 는 `alerts` · `matches` · `events` · `commitments` 를 전부 비운다.
+> 아래 "9/3 보험"과 "`--merge` 는 먼저" 항목은 그날의 판단을 남기기 위한 **기록**이며,
+> 지금은 실행 절차가 아니다.
 
 - `detect` 는 실행 첫 줄에 `pending N건 → 사전 필터 통과 M건 → 배치 K회 · 처리 구간: YYYY-MM-DD ~ YYYY-MM-DD` 를 출력한다.
   `--limit` 없이 M 이 200건을 넘으면 `--yes` 없이는 실행하지 않는다. `--since/--until` 은 `articles.published_at`(KST 날짜, until 포함)
@@ -65,8 +72,8 @@ uv run esg-watchdog publish --company 030200
 - **재실행 안전(멱등)**: 모든 단계는 다시 실행해도 같은 행을 두 번 만들지 않는다 — articles 는 url_hash, commitments 는
   (company_id, normalized_text), events 는 병합 키(category · event_type · 연-월), matches 는 (commitment_id, event_id), alerts 는 match_id.
   score 는 부분 재계산 없이 전량 다시 계산한다.
-- **9/3 보험**: 파이프라인이 완주하지 못하면 씨앗 데이터를 계약 테이블에 직접 넣는다 — `uv run esg-watchdog load-fixtures --dir app/fixtures --truncate`.
-- **`load-fixtures --merge` 는 반드시 파이프라인보다 먼저 돌린다.** fixture 의 documents(1~3) · articles(101~108) 는 작은 id 대역이라,
+- (기록 — 실행 금지, 위 경고 참조) **9/3 보험**: 파이프라인이 완주하지 못하면 씨앗 데이터를 계약 테이블에 직접 넣는다 — `uv run esg-watchdog load-fixtures --dir app/fixtures --truncate`.
+- (기록 — 실행 금지, 위 경고 참조) **`load-fixtures --merge` 는 반드시 파이프라인보다 먼저 돌린다.** fixture 의 documents(1~3) · articles(101~108) 는 작은 id 대역이라,
   파이프라인이 먼저 같은 id 를 만들면 merge 가 그 행을 skip 하고 `commitments.source.doc_id` 가 엉뚱한 문서를 가리킨다.
 - **수집이 이미 끝난 뒤에는 `run-all` 을 쓰지 마라.** collect 부터 다시 돌아 1~2시간이 걸린다. 단계별로 실행한다.
 - **LLM 캐시**(`LLM_CACHE_DIR`, 기본 `.llm_cache/`)는 스키마만 통과하면 금지어가 든 응답도 저장한다. 폐기된 경보를 다시 시도하려면
@@ -105,7 +112,7 @@ uv run uvicorn esg_watchdog.main:app
 
 ## 심사 기간 규칙
 
-- **9/6 밤 데이터 동결** · Render **Auto-Deploy Off**(절차는 docs/deploy.md).
+- **9/6 밤 데이터 동결** (실제 마지막 쓰기는 9/7 새벽 D-44 교정) · Render **Auto-Deploy Off**(절차는 docs/deploy.md).
 - **9/7 ~ 9/11 프로덕션 DB 에 배치 쓰기 금지**(collect · extract · detect · match · score · publish · load-fixtures 전부).
 - 배포는 가용성 복구(헬스 실패 · 롤백)만 한다. 화면·데이터를 바꾸는 배포는 하지 않는다.
 
